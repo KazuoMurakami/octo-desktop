@@ -1,0 +1,83 @@
+# Publicar uma versão: atualize "version" no package.json, crie a tag e envie.
+#   git tag v0.2.0 && git push origin v0.2.0
+# Cada sistema gera e testa o seu instalador; o último job monta um rascunho de release com
+# todos eles, os checksums SHA-256 e a atestação de proveniência (gh attestation verify).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Ações de terceiros fixadas por SHA; só o job que publica pode escrever no repositório.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            selftest: ./release/win-unpacked/Octo.exe --self-test
+          - os: macos-latest
+            selftest: ./release/mac-arm64/Octo.app/Contents/MacOS/Octo --self-test
+          - os: ubuntu-latest
+            selftest: xvfb-run -a ./release/linux-unpacked/octo --no-sandbox --self-test
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run dist
+        env:
+          # Sem certificado de assinatura (veja "Primeira abertura" no README).
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Autoteste do app empacotado
+        shell: bash
+        env:
+          OCTO_DATA_DIR: ${{ runner.temp }}/octo-selftest
+        run: ${{ matrix.selftest }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: octo-${{ matrix.os }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.AppImage
+            release/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums SHA-256
+        working-directory: artifacts
+        run: sha256sum * | tee SHA256SUMS.txt
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/*.exe
+            artifacts/*.dmg
+            artifacts/*.AppImage
+            artifacts/*.deb
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: artifacts/*

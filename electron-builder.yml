@@ -1,0 +1,48 @@
+# Instaladores do app desktop: `npm run dist` gera os do sistema atual em release/.
+# As releases do GitHub são montadas pelo workflow em .github/workflows/release.yml.
+# Os nomes dos arquivos não levam a versão: assim os links .../releases/latest/download/<arquivo>
+# do README sempre apontam para a versão mais nova.
+appId: dev.octo.app
+productName: Octo
+copyright: Copyright © 2026 Octo contributors
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**
+  - dist-electron/**
+  - package.json
+
+win:
+  target: nsis
+  icon: build/icon.png
+  artifactName: Octo-Setup.${ext}
+
+nsis:
+  oneClick: true
+  perMachine: false
+  deleteAppDataOnUninstall: false
+
+mac:
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+  category: public.app-category.developer-tools
+  icon: build/icon.png
+  artifactName: Octo-mac-${arch}.${ext}
+
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  category: Development
+  icon: build/icon.png
+  maintainer: Octo <99770253+KazuoMurakami@users.noreply.github.com>
+  synopsis: Issues no estilo Linear para o Claude Code em vários repositórios
+  artifactName: Octo-linux-x64.${ext}
+
+publish: null

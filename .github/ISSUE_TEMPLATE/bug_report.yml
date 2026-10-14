@@ -1,0 +1,40 @@
+name: Bug
+description: Algo não funciona como deveria
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: O que aconteceu?
+      description: O que você fez, o que esperava e o que aconteceu. Prints ajudam.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Como reproduzir
+      placeholder: |
+        1. Conectei a pasta …
+        2. Deleguei a issue …
+        3. Apareceu o erro …
+  - type: input
+    id: version
+    attributes:
+      label: Versão do Octo
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Sistema
+      options: [Windows, macOS (Apple Silicon), macOS (Intel), Linux]
+    validations:
+      required: true
+  - type: input
+    id: claude
+    attributes:
+      label: Saída de `claude --version`
+  - type: markdown
+    attributes:
+      value: "**Falha de segurança?** Não abra uma issue: siga o [SECURITY.md](../blob/main/SECURITY.md)."
