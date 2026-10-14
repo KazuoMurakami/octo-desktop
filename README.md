@@ -139,13 +139,15 @@ No Windows, rode `Get-FileHash .\Octo-Setup.exe` no PowerShell e compare com a l
 3. **Delegue.** Escolha a conta, o modelo, o effort e as permissões, e decida entre segundo plano e terminal.
 4. **Revise.** Veja o diff na aba **Mudanças**, abra no editor com **Abrir em…**, responda ao agente pela própria issue ou continue a conversa no terminal.
 
-Atalhos: `C` cria uma issue, `Ctrl K` (`⌘ K` no macOS) abre a paleta de comandos, `Esc` fecha painéis. No app desktop, o menu **Ajuda** leva à documentação, mostra a versão e abre um relato de problema já preenchido.
+Atalhos: `C` cria uma issue, `Ctrl K` (`⌘ K` no macOS) abre a paleta de comandos, `Esc` fecha painéis e `Ctrl V` (`⌘ V`) anexa um print à resposta ao agente (com texto copiado junto, use `Alt V` ou `⌥ V`). No app desktop, o menu **Ajuda** leva à documentação, mostra a versão e abre um relato de problema já preenchido.
 
 ## Trabalhe do seu jeito
 
 - **Terminal do sistema.** Em **Preferências** você escolhe onde o Claude abre: Prompt de Comando, Windows PowerShell ou PowerShell 7 no Windows (a janela abre no seu app de terminal padrão, como o Windows Terminal), Terminal ou iTerm2 no macOS, e o emulador instalado no Linux. **Continuar no terminal** retoma a mesma conversa (`claude --resume`) com a mesma conta e as mesmas opções, e **Terminal aqui** abre só o shell na pasta.
 - **Editor.** **Abrir em…** abre a pasta no VS Code, Cursor, Windsurf ou Zed. Quando a sessão envolve vários repositórios, o Octo cria um workspace com todos eles, e o painel de controle de versão do editor mostra as mudanças de cada um.
 - **Mudanças.** A aba **Mudanças** de cada sessão mostra o que está diferente do último commit em cada repositório, inclusive arquivos novos. Também dá para ver as mudanças de qualquer repositório ou pasta em **Repositórios**.
+- **Imagens.** Cole um print, arraste ou anexe imagens na resposta ao agente ou ao delegar em segundo plano: elas vão para o Claude junto com a mensagem e ficam como miniaturas no feed da sessão.
+- **Worktrees.** Com **Trabalhar num worktree** marcado ao delegar, a issue ganha uma pasta própria em `~/.octo/worktrees` (ex.: `~/.octo/worktrees/projetos/prj-12`), com um worktree git de cada repositório dela numa branch curta, a mesma em todos (ex.: `prj-12-checkout-pix`). A branch sai da branch padrão, atualizada com `git fetch`, ou da branch atual, e as próximas sessões da issue continuam no mesmo worktree. Arquivos fora do git listados no `.worktreeinclude` do repositório, como o `.env`, vão junto, como no Claude Code. Remover o worktree (no menu da issue) apaga a pasta; as branches e os commits ficam nos repositórios.
 
 No macOS e no Linux, o app desktop carrega o ambiente do seu shell de login (PATH, chaves e variáveis do Claude Code, proxy, AWS etc.), então as sessões em segundo plano enxergam o mesmo ambiente do seu terminal.
 
@@ -180,12 +182,12 @@ Em cada sessão dá para ajustar as mesmas opções do CLI: modelo (`--model`), 
 
 ## Privacidade e segurança
 
-- **Tudo local.** Workspaces, issues e sessões ficam em `~/.octo`. O Octo não tem conta, telemetria nem analytics. A única conexão que ele faz por conta própria é consultar a página de releases do GitHub, no máximo a cada 6 horas, para avisar de versões novas (dá para desligar em **Preferências**).
+- **Tudo local.** Workspaces, issues e sessões ficam em `~/.octo`. O Octo não tem conta, telemetria nem analytics. A única conexão que ele faz por conta própria é consultar a página de releases do GitHub, no máximo a cada 6 horas, para avisar de versões novas (dá para desligar em **Preferências**). Fora isso, só o git, ao criar um worktree a partir da branch padrão: ele consulta e atualiza essa branch no remoto `origin` (`git ls-remote` e `git fetch`) com as credenciais que já usa, sem abrir pedido de senha.
 - **Login do Claude.** O Octo não lê o login do Claude Code (o `.credentials.json` ou o Keychain do macOS): quem fala com a Anthropic é o próprio Claude Code.
 - **settings.json.** O Octo lê e edita o `settings.json` de cada conta quando você usa **Configuração do Claude**, e guarda a versão anterior em `~/.octo/backups`. Se você guarda chaves nesse arquivo (no bloco `env`, como `ANTHROPIC_API_KEY`), elas aparecem nessa tela e ficam nos backups. Ao criar uma conta copiando as preferências da principal, as chaves conhecidas (Anthropic, AWS, `apiKeyHelper`) ficam de fora; detalhes em [Dados e privacidade](docs/dados-e-privacidade.md).
 - **API protegida.** O servidor interno escuta só em `127.0.0.1`, exige um token guardado em `~/.octo/token` (legível só pelo seu usuário) e recusa requisições de outros sites.
 - **App isolado.** A janela roda em sandbox, nega pedidos de câmera, microfone e localização e abre links externos no navegador. O executável vem com os fuses de segurança do Electron conferidos a cada release. Detalhes no [SECURITY.md](SECURITY.md).
-- **Seus repositórios.** O Octo não escreve neles. Quem altera arquivos é o Claude, dentro das permissões que você escolher, e o `CLAUDE.md` de contexto só é gravado quando você pede.
+- **Seus repositórios.** O Octo não escreve neles. Quem altera arquivos é o Claude, dentro das permissões que você escolher, e o `CLAUDE.md` de contexto só é gravado quando você pede. A exceção são os worktrees: com **Trabalhar num worktree**, o Octo roda `git fetch` (para partir da versão mais recente da branch padrão) e `git worktree` em cada repositório da issue, o que cria uma branch e um worktree para ela. Ele nunca faz commit nem push, e remover o worktree mantém a branch.
 - **Cuidado com "Sem restrições".** Esse modo (`bypassPermissions`) deixa o agente rodar qualquer comando. Use só em pastas descartáveis.
 
 Encontrou uma falha? Veja o [SECURITY.md](SECURITY.md) para reportar em privado. Mais detalhes sobre o que fica onde em [docs/dados-e-privacidade.md](docs/dados-e-privacidade.md).
@@ -239,7 +241,7 @@ Quando sai uma versão nova, o Octo avisa na barra lateral. Baixe o instalador e
 
 Desinstale pelo sistema: **Configurações → Aplicativos** no Windows, arrastar o Octo de Aplicativos para o Lixo no macOS, `sudo apt remove octo` no Linux (o AppImage é só apagar o arquivo). Isso remove o programa, mas mantém seus dados. Para remover tudo, apague também:
 
-- `~/.octo` (no Windows, `C:\Users\<você>\.octo`): workspaces, issues, sessões, backups e o token da API.
+- `~/.octo` (no Windows, `C:\Users\<você>\.octo`): workspaces, issues, sessões, as imagens das conversas (`images/`), os worktrees das issues (`worktrees/`), backups e o token da API. Um worktree pode ter trabalho sem commit: remova cada um antes, no painel da issue (**Mais ações → Remover worktree…**), que mostra o que se perde. Se apagar a pasta direto, o git ainda lembra desses worktrees: em cada repositório, `git worktree list` mostra os que ficaram, e `git worktree remove --force <caminho>` faz o git esquecer cada um (as branches das issues continuam). Evite o `git worktree prune` sem antes conferir com `git worktree prune --dry-run -v`: ele também esquece worktrees seus que estejam, por exemplo, num disco desconectado.
 - A pasta do app: `%APPDATA%\Octo` no Windows, `~/Library/Application Support/Octo` no macOS, `~/.config/Octo` no Linux (cache da janela).
 - As pastas `~/.claude-<nome>` das contas extras que você criou pelo Octo, se não quiser mais essas contas. Elas guardam o login, o histórico e a configuração delas, e o Octo não as apaga nem quando você remove a conta no app.
 - Se você gerou `CLAUDE.md` pelo Octo, o bloco entre `<!-- octo:workspace:start -->` e `<!-- octo:workspace:end -->` nesses arquivos.

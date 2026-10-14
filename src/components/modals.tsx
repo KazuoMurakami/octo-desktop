@@ -1,17 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Bot, Code2, FileDiff, FileText, FolderGit2, FolderSearch, LogIn, Settings2, SquareTerminal } from 'lucide-react';
+import { AlertTriangle, Bot, Code2, FileDiff, FileText, FolderGit2, FolderSearch, GitBranch, ImagePlus, LogIn, Settings2, SquareTerminal } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   PRIORITY_LABEL, STATUSES, STATUS_LABEL,
-  type IssueStatus, type Priority, type SessionSettings, type Workspace,
+  type IssueStatus, type Priority, type SessionSettings, type Workspace, type WorktreeBase,
 } from '../../shared/types.ts';
+import { worktreeBranchName } from '../../shared/worktree.ts';
 import { api, settingsInput, type ContextInfo, type FolderInspection } from '../api.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { useIntegrations } from '../integrations.ts';
-import { commonFolder, hue, modKey, relativeTo } from '../util.ts';
+import { commonFolder, hue, modKey, relativeTo, shortRepoName } from '../util.ts';
+import { homePath, mirrorIn, plannedWorktreeRoot, sessionFolderLabel, worktreeBranch, worktreeName } from '../worktree.ts';
 import { loginHint, startLogin } from './AccountsView.tsx';
 import { ChangesView } from './ChangesView.tsx';
 import { AccountAvatar, PriorityIcon, StatusIcon } from './icons.tsx';
+import { AttachButton, DropHint, ImageTray, useImageAttachments } from './Images.tsx';
 import { folderLabel } from './OpenMenu.tsx';
 import { SessionSettingsForm } from './SessionSettings.tsx';
 import { AutoTextarea, Field, Kbd, Menu, Modal, RepoChip } from './ui.tsx';
@@ -49,12 +52,14 @@ export function Modals() {
  * em "Cancelar": um Enter distraído não apaga nada. Aberta sobre outro modal ou sobre o painel da
  * issue, o Esc fecha só ela (é a camada de cima).
  */
-export function ConfirmDialog({ title, children, confirmLabel, busyLabel = 'Aguarde…', tone = 'danger', onConfirm, onClose }: {
+export function ConfirmDialog({ title, children, confirmLabel, busyLabel = 'Aguarde…', tone = 'danger', disabled = false, onConfirm, onClose }: {
   title: ReactNode;
   children: ReactNode;
   confirmLabel: string;
   busyLabel?: string;
   tone?: 'danger' | 'primary';
+  /** Ainda não dá para confirmar: falta carregar algo, ou algo impede a ação (o texto do diálogo diz o quê). */
+  disabled?: boolean;
   /** Pode ser assíncrona: o diálogo espera e só fecha se der certo (o erro já vira aviso em api.ts). */
   onConfirm: () => unknown;
   onClose: () => void;
@@ -80,7 +85,7 @@ export function ConfirmDialog({ title, children, confirmLabel, busyLabel = 'Agua
       footer={
         <>
           <button className="ghost-btn" autoFocus onClick={onClose} disabled={busy}>Cancelar</button>
-          <button className={tone === 'danger' ? 'danger-btn' : 'primary-btn'} onClick={() => void confirm()} disabled={busy}>
+          <button className={tone === 'danger' ? 'danger-btn' : 'primary-btn'} onClick={() => void confirm()} disabled={busy || disabled}>
             {busy ? busyLabel : confirmLabel}
           </button>
         </>
@@ -200,6 +205,8 @@ function NewIssueModal({ status: initialStatus, repoIds: initialRepos, onClose }
         {selected.length > 0 && (
           <div className="cwd-hint">
             O agente vai rodar em <code>{folderLabel(workspace, commonFolder(workspace, selected))}</code>
+            {/* Worktree por padrão: a mesma pasta, só que na cópia da issue em <dados>/worktrees. */}
+            {workspace.defaultWorktree ? ', num worktree só da issue' : ''}
             {selected.length > 1 ? `, com o contexto de ${selected.length} repositórios.` : '.'}
           </div>
         )}
@@ -234,12 +241,59 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
   const [instructions, setInstructions] = useState('');
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(false);
+  // Já vem marcado se a issue tem um worktree (as sessões dela continuam nele) ou se o workspace pede um por padrão.
+  const [worktreeOn, setWorktreeOn] = useState(() => Boolean(issue?.worktree || workspace?.defaultWorktree));
+  const [base, setBase] = useState<WorktreeBase>('default');
+  // O nome de verdade (com -2, -3 quando a pasta ou a branch já existem) vem do servidor; até lá, a prévia calculada aqui.
+  const [plan, setPlan] = useState<{ key: string; root: string; branch: string } | null>(null);
+  const planKey = issue && worktreeOn && !issue.worktree && issue.repoIds.length ? `${issue.id}|${issue.title}|${issue.repoIds.join(',')}` : '';
+  useEffect(() => {
+    if (!planKey) return;
+    let alive = true;
+    api.worktreePlan(issueId)
+      .then((next) => {
+        if (alive && next && !next.reuse) setPlan({ key: planKey, root: next.root, branch: next.branch });
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [planKey, issueId]);
+  const home = useStore((s) => s.meta?.home);
+  const dataDir = useStore((s) => s.meta?.dataDir ?? '');
+  // No terminal, a imagem é colada no próprio Claude, com o atalho dele.
+  const platform = useStore((s) => s.meta?.platform);
+  const pasteKey = platform === 'win32' ? 'Alt+V' : 'Ctrl+V';
+  const attachments = useImageAttachments({
+    // Delegando, o pedido já saiu com as imagens que estavam aqui: uma solta agora não iria junto.
+    blocked: busy
+      ? 'Espere a delegação terminar.'
+      : mode === 'terminal' ? `No terminal, as imagens não vão junto: cole direto no Claude com ${pasteKey}.` : undefined,
+  });
 
   if (!workspace || !issue) return null;
   const account = accounts.find((a) => a.id === accountId);
   const status = account ? accountStatus[account.id] : undefined;
   const selected = repos.filter((r) => issue.repoIds.includes(r.id));
   const cwd = commonFolder(workspace, selected);
+  // Worktree: o que impede, onde ele fica e quais repositórios entram nele agora (num worktree novo, todos).
+  const current = issue.worktree ?? null;
+  const worktreeBlocked = issue.worktree?.removing
+    ? 'A remoção do worktree desta issue parou no meio. Termine-a antes (Mais ações › Remover worktree) para usar um worktree de novo.'
+    : !selected.length
+      ? 'Marque os repositórios da issue para trabalhar num worktree.'
+      : selected.length > 1 && selected.some((r) => r.relPath === '.')
+        ? 'A issue junta o repositório da raiz do workspace com repositórios dentro dele, e um worktree não comporta isso.'
+        : null;
+  const withWorktree = worktreeOn && !worktreeBlocked;
+  const planned = plan?.key === planKey ? plan : null;
+  const worktreeRoot = current?.root ?? planned?.root ?? plannedWorktreeRoot(dataDir, workspace, issue.identifier);
+  const entering = current ? selected.filter((r) => !current.repos.some((entry) => entry.repoId === r.id)) : selected;
+  const creatingWorktree = withWorktree && entering.length > 0;
+  const dirtyEntering = entering.filter((r) => (r.dirty ?? 0) > 0);
+  const openBranches = [...new Set(entering.map((r) => r.branch))];
+  const openBranch = openBranches.length === 1 && openBranches[0] ? openBranches[0] : 'de cada repositório';
+  const sessionDir = withWorktree ? mirrorIn(worktreeRoot, workspace, cwd) : cwd;
   // Sem login confirmado pelo `claude auth status`. Se a verificação falhou, não dá para afirmar nada.
   const needsLogin = Boolean(account && status && !status.loggedIn && !status.error);
   const headlessWithoutLogin = needsLogin && mode === 'headless';
@@ -247,9 +301,18 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
   const go = async () => {
     setBusy(true);
     try {
-      await api.delegate(issue.id, { accountId, ...settingsInput(settings), instructions, mode });
-      useStore.getState().set({ modal: null, openIssueId: issue.id });
-      toast(mode === 'terminal' ? 'Terminal aberto com o Claude.' : `${account?.name} começou a trabalhar em ${issue.identifier}.`, 'success');
+      // No terminal elas ficam de fora (o aviso está na tela).
+      const images = mode === 'headless' ? attachments.images.map(({ mediaType, data }) => ({ mediaType, data })) : [];
+      const session = await api.delegate(issue.id, {
+        accountId, ...settingsInput(settings), instructions, mode, worktree: withWorktree ? base : null, ...(images.length ? { images } : {}),
+      });
+      // Só fecha (e abre a issue) se esta janela ainda é a aberta: a resposta não fecha outra que tenha entrado no lugar dela.
+      const shown = useStore.getState().modal;
+      if (shown?.kind === 'delegate' && shown.issueId === issue.id) useStore.getState().set({ modal: null, openIssueId: issue.id });
+      const where = session.worktree ? ` no worktree ${worktreeName(session.worktree)}` : '';
+      toast(mode === 'terminal' ? `Terminal aberto com o Claude${where}.` : `${account?.name} começou a trabalhar em ${issue.identifier}${where}.`, 'success');
+    } catch {
+      /* o aviso de erro já apareceu (api.ts) */
     } finally {
       setBusy(false);
     }
@@ -272,23 +335,32 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
     <Modal
       width={600}
       title={<>Delegar <span className="ident">{issue.identifier}</span></>}
-      onClose={onClose}
-      dirty={Boolean(instructions.trim())}
+      // Delegando (criar o worktree pode levar alguns segundos), a janela não fecha, nem pergunta se descarta o texto.
+      onClose={() => !busy && onClose()}
+      dirty={!busy && Boolean(instructions.trim() || attachments.images.length)}
       footer={
         <>
           {account && !status && <span className="foot-hint dim">Verificando o login da conta…</span>}
           {status?.error && !status.loggedIn && (
             <span className="foot-hint is-warn" title={status.error}>Não foi possível verificar o login desta conta.</span>
           )}
-          <button className={headlessWithoutLogin ? 'ghost-btn' : 'primary-btn'} onClick={go} disabled={busy || !accountId}>
-            {mode === 'terminal'
-              ? <><SquareTerminal size={14} /> Abrir no terminal</>
-              : <><Bot size={14} /> {headlessWithoutLogin ? 'Delegar mesmo assim' : 'Delegar'}</>}
+          <button
+            className={headlessWithoutLogin ? 'ghost-btn' : 'primary-btn'}
+            onClick={go}
+            disabled={busy || !accountId || (mode === 'headless' && attachments.processing > 0)}
+          >
+            {busy && creatingWorktree
+              ? <><GitBranch size={14} /> Criando o worktree…</>
+              : mode === 'terminal'
+                ? <><SquareTerminal size={14} /> Abrir no terminal</>
+                : <><Bot size={14} /> {headlessWithoutLogin ? 'Delegar mesmo assim' : 'Delegar'}</>}
           </button>
         </>
       }
     >
-      <div className="delegate">
+      {/* Delegando, os campos ficam travados: o pedido já saiu com o que estava neles. O fieldset desativa todos de uma vez,
+          inclusive os das opções da sessão; o estilo só tira a moldura padrão dele. */}
+      <fieldset className="delegate" disabled={busy}>
         <div className="mode-pick">
           <button className={mode === 'headless' ? 'is-on' : ''} onClick={() => setMode('headless')}>
             <Bot size={16} />
@@ -303,8 +375,66 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
         </div>
 
         <div className="cwd-hint">
-          Pasta: <code>{folderLabel(workspace, cwd)}</code>
+          Pasta: <code title={sessionDir}>{withWorktree ? sessionFolderLabel(workspace, sessionDir, { root: worktreeRoot }) : folderLabel(workspace, cwd)}</code>
           {selected.length > 1 ? ` · contexto de ${selected.map((r) => r.name.split('/').at(-1)).join(' + ')}` : ''}
+        </div>
+
+        <div className="worktree-option">
+          <label className="check">
+            <input type="checkbox" checked={withWorktree} disabled={Boolean(worktreeBlocked)} onChange={(e) => setWorktreeOn(e.target.checked)} />
+            <span className="check-text">
+              <strong>Trabalhar num worktree</strong>
+              <small>
+                {worktreeBlocked ?? (!current
+                  ? 'Uma pasta só desta issue, numa branch própria: a pasta original dos repositórios fica como está.'
+                  : withWorktree
+                    ? <>Continua no worktree <code>{worktreeName(current)}</code>, na branch <code>{worktreeBranch(current)}</code>, com o que já foi feito nele.</>
+                    : <>Esta sessão roda na pasta original. O worktree <code>{worktreeName(current)}</code> continua no disco para as próximas.</>)}
+              </small>
+            </span>
+          </label>
+          {creatingWorktree && (
+            <div className="worktree-details">
+              {current ? (
+                <span>
+                  {entering.map(shortRepoName).join(', ')} {entering.length === 1 ? 'entra' : 'entram'} no worktree agora, na branch{' '}
+                  <code>{worktreeBranch(current)}</code>.
+                </span>
+              ) : (
+                <span>
+                  pasta <code title={worktreeRoot}>{homePath(worktreeRoot, home)}</code> · branch{' '}
+                  <code title={planned ? undefined : 'Se já existir uma branch com esse nome, o Octo acrescenta -2, -3…'}>
+                    {planned?.branch ?? worktreeBranchName(issue.identifier, issue.title)}
+                  </code>
+                </span>
+              )}
+              <div className="worktree-base">
+                <span className="dim">a partir de</span>
+                <div className="segmented" role="group" aria-label="De onde sai a branch do worktree">
+                  <button type="button" aria-pressed={base === 'default'} className={base === 'default' ? 'is-on' : ''} onClick={() => setBase('default')}>
+                    Branch padrão
+                  </button>
+                  <button type="button" aria-pressed={base === 'current'} className={base === 'current' ? 'is-on' : ''} onClick={() => setBase('current')}>
+                    Branch atual ({openBranch})
+                  </button>
+                </div>
+              </div>
+              <span className="field-hint">
+                {base === 'default'
+                  ? 'A branch padrão do origin (origin/HEAD; sem ela, main ou master), atualizada com git fetch. Sem rede, sai da versão que já está no computador.'
+                  : 'O commit em que cada repositório está agora, sem buscar nada.'}
+              </span>
+              {dirtyEntering.length > 0 && (
+                <div className="composer-warning">
+                  <AlertTriangle size={13} />
+                  <span>
+                    {dirtyEntering.map((r) => `${shortRepoName(r)} (${r.dirty} ${r.dirty === 1 ? 'arquivo' : 'arquivos'})`).join(', ')}{' '}
+                    {dirtyEntering.length === 1 ? 'tem' : 'têm'} alterações sem commit. Elas ficam na pasta original e não vão para o worktree.
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <Field label="Conta">
@@ -350,10 +480,36 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
           />
         )}
 
-        <Field label="Instruções adicionais" hint="Opcional. Vai junto com o título e a descrição da issue. Para usar uma skill, cite o nome dela (ex.: use a skill code-review).">
-          <AutoTextarea minRows={2} value={instructions} onChange={(e) => setInstructions(e.target.value)} placeholder="Ex.: comece pela loja-api e rode os testes no final." />
-        </Field>
-      </div>
+        <div className="attach-zone" {...attachments.dropProps}>
+          <DropHint show={attachments.dragging} />
+          <Field
+            label="Instruções adicionais"
+            hint="Opcional. Vai junto com o título e a descrição da issue. Para usar uma skill, cite o nome dela (ex.: use a skill code-review). Em segundo plano, dá para colar, arrastar ou anexar imagens."
+          >
+            <AutoTextarea
+              minRows={2}
+              value={instructions}
+              onChange={(e) => setInstructions(e.target.value)}
+              onPaste={attachments.onPaste}
+              onKeyDown={attachments.onKeyDown}
+              placeholder="Ex.: comece pela loja-api e rode os testes no final."
+            />
+          </Field>
+          <ImageTray images={attachments.images} processing={attachments.processing} onRemove={attachments.remove}>
+            {mode === 'headless' && (
+              <AttachButton onFiles={attachments.add} className="ghost-btn is-small">
+                <ImagePlus size={13} /> Anexar imagem
+              </AttachButton>
+            )}
+          </ImageTray>
+          {mode === 'terminal' && attachments.images.length > 0 && (
+            <div className="composer-warning">
+              <AlertTriangle size={13} />
+              <span>Estas imagens só vão junto em segundo plano. No terminal, cole cada uma direto no Claude com {pasteKey}.</span>
+            </div>
+          )}
+        </div>
+      </fieldset>
     </Modal>
   );
 }

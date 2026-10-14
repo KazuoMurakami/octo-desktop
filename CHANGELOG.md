@@ -13,6 +13,8 @@
 - Opções do CLI por sessão: modelo, effort, permissões, agente, modelo reserva, pastas extras e orçamento.
 - Avisos quando uma sessão em segundo plano termina ou precisa de você (o **Ver** abre a sessão), com notificação do sistema se você permitir; o título da janela mostra quantas sessões aguardam você.
 - Permissões negadas ao fim de uma sessão em segundo plano: **Permitir e continuar** ou **Concluir assim mesmo**.
+- Imagens na conversa: cole um print (Ctrl/⌘ V, ou Alt/⌥ V com texto copiado junto), arraste ou anexe imagens na resposta ao agente e ao delegar em segundo plano. Elas vão para o Claude com a mensagem e aparecem como miniaturas no feed.
+- Worktrees por issue, com nomes curtos: **Trabalhar num worktree** (ao delegar, ou ligado por padrão no workspace) cria uma pasta em `~/.octo/worktrees` com cada repositório da issue numa branch como `prj-12-checkout-pix`, a partir da branch padrão atualizada ou da branch atual. O `.worktreeinclude` leva o `.env` e afins, as sessões seguintes da issue continuam ali, e remover o worktree mantém as branches.
 - Sessões no terminal: **Sincronizar** traz o andamento para o Octo e **Marcar como concluída** fecha a sessão. Na aba Mudanças, o que já estava alterado antes da sessão começar aparece separado.
 - Teclado: paleta de comandos (Ctrl/⌘ K), lista de atalhos (`?`) e Esc que fecha uma camada de cada vez. Menus, diálogos e o quadro funcionam com teclado e leitor de tela.
 - Nada se perde: título e descrição da issue são salvos enquanto você digita, e fechar um formulário com texto pede confirmação.

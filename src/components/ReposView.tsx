@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Code2, ExternalLink, FileDiff, FileText, FolderOpen, GitBranch, Plus, RefreshCw, SquareTerminal, Trash2 } from 'lucide-react';
+import { AlertTriangle, Code2, ExternalLink, FileDiff, FileText, FolderOpen, GitBranch, Plus, RefreshCw, SquareTerminal, Trash2 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import type { Workspace } from '../../shared/types.ts';
 import { api } from '../api.ts';
@@ -7,6 +7,7 @@ import { setting, useAccountConfig } from '../claudeConfig.ts';
 import { openClaudeIn } from '../integrations.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { ago, hue, repoGroups, shortRepoName } from '../util.ts';
+import { homePath, worktreesFolder } from '../worktree.ts';
 import { loginHint } from './AccountsView.tsx';
 import { AccountAvatar } from './icons.tsx';
 import { ConfirmDialog } from './modals.tsx';
@@ -156,8 +157,10 @@ export function ReposView() {
 }
 
 function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
-  const { accounts, accountStatus, issues, sessions } = useStore(
-    useShallow((s) => ({ accounts: s.accounts, accountStatus: s.accountStatus, issues: s.issues, sessions: s.sessions })),
+  const { accounts, accountStatus, issues, sessions, home, dataDir } = useStore(
+    useShallow((s) => ({
+      accounts: s.accounts, accountStatus: s.accountStatus, issues: s.issues, sessions: s.sessions, home: s.meta?.home, dataDir: s.meta?.dataDir ?? '',
+    })),
   );
   const [guidance, setGuidance] = useState(workspace.guidance);
   const [prefix, setPrefix] = useState(workspace.key);
@@ -184,6 +187,12 @@ function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
     }
   };
 
+  const saveDefaultWorktree = (on: boolean) =>
+    void api.updateWorkspace(workspace.id, { defaultWorktree: on }).then(
+      () => toast(on ? 'As próximas delegações já vêm com worktree.' : 'As próximas delegações vêm sem worktree.', 'success'),
+      () => undefined,
+    );
+
   const changeDepth = async (scanDepth: number) => {
     setRescanning(true);
     try {
@@ -196,6 +205,8 @@ function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
   };
 
   const ownIssues = issues.filter((i) => i.workspaceId === workspace.id).length;
+  // Sem o workspace, nada removeria esses worktrees: o servidor recusa desconectar enquanto eles existirem.
+  const withWorktree = issues.filter((i) => i.workspaceId === workspace.id && i.worktree);
   const ownSessions = sessions.filter((s) => s.workspaceId === workspace.id);
   const running = ownSessions.filter((s) => s.state === 'active' || s.state === 'pending').length;
   const lost = [
@@ -261,6 +272,15 @@ function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
           accountDefault={setting(config, 'effortLevel')}
         />
       </Field>
+      <Field
+        label="Worktree por padrão"
+        hint={`Cada issue trabalha numa pasta própria em ${homePath(worktreesFolder(dataDir), home)}, numa branch curta; a pasta original dos repositórios fica como está.`}
+      >
+        <label className="check">
+          <input type="checkbox" checked={Boolean(workspace.defaultWorktree)} onChange={(e) => saveDefaultWorktree(e.target.checked)} />
+          Ao delegar, já marcar “Trabalhar num worktree”
+        </label>
+      </Field>
       <button className="ghost-btn is-danger" onClick={() => setConfirmDisconnect(true)}>
         <Trash2 size={14} /> Desconectar workspace
       </button>
@@ -270,6 +290,7 @@ function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
           title={`Desconectar "${workspace.name}"?`}
           confirmLabel="Desconectar"
           busyLabel="Desconectando…"
+          disabled={withWorktree.length > 0}
           onConfirm={() => api.deleteWorkspace(workspace.id)}
           onClose={() => setConfirmDisconnect(false)}
         >
@@ -281,6 +302,16 @@ function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
             Nada é apagado de <span className="mono">{workspace.rootPath}</span> nem dos repositórios. Para usar de novo, é só conectar a pasta outra vez
             (as issues não voltam).
           </p>
+          {withWorktree.length > 0 && (
+            <div className="composer-warning">
+              <AlertTriangle size={13} />
+              <span>
+                Antes, remova {withWorktree.length === 1 ? 'o worktree da issue' : 'os worktrees das issues'}{' '}
+                <span className="mono">{withWorktree.map((i) => i.identifier).join(', ')}</span> (no painel de cada uma, Mais ações › Remover worktree).
+                Sem o workspace, nada mais os removeria, e as branches ficariam presas nessas pastas.
+              </span>
+            </div>
+          )}
         </ConfirmDialog>
       )}
     </div>

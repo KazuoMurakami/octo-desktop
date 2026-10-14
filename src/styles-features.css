@@ -45,6 +45,8 @@ select.input:disabled { cursor: default; opacity: 0.6; }
 /* ---------------------------------------------------------------- painel da issue */
 
 .drawer:focus { outline: none; }
+/* A lateral rola quando o histórico é longo: nada nela encolhe (uma propriedade de duas linhas cobriria a de baixo). */
+.drawer-side > * { flex-shrink: 0; }
 .save-state { margin-left: 8px; font-size: 11.5px; color: var(--text-3); animation: fade 0.2s ease; }
 .desc-view:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .desc-placeholder { color: var(--text-3); }
@@ -76,6 +78,111 @@ select.input:disabled { cursor: default; opacity: 0.6; }
 /* A caixa de resposta para de crescer e rola: o botão Enviar continua à vista. */
 .composer textarea { max-height: 40vh; overflow-y: auto; }
 .slash-menu { max-height: min(320px, 45vh); overflow-y: auto; }
+.composer-attach { width: 30px; padding: 0; justify-content: center; flex: none; }
+
+/* ---------------------------------------------------------------- imagens na conversa */
+
+/* Áreas que aceitam imagens arrastadas. O aviso cobre a área sem receber os eventos do arrastar (nada pisca). */
+.composer, .attach-zone { position: relative; }
+.attach-zone { display: flex; flex-direction: column; gap: 8px; }
+.drop-hint {
+  position: absolute;
+  inset: 4px;
+  z-index: 25;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px dashed var(--focus);
+  border-radius: 9px;
+  background: rgba(11, 11, 13, 0.88);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  pointer-events: none;
+  animation: fade 0.12s ease;
+}
+.drop-hint svg { color: var(--focus); }
+.attach-zone .drop-hint { inset: -6px; }
+
+/* Antes de enviar: miniaturas com o número (#1, #2…) e o × no canto. */
+.image-tray { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.image-thumb { position: relative; flex: none; width: 64px; height: 64px; border-radius: 8px; border: 1px solid var(--border-strong); background: var(--bg-2); }
+.image-thumb-open { display: block; width: 100%; height: 100%; border-radius: 7px; overflow: hidden; }
+.image-thumb-open img { display: block; width: 100%; height: 100%; object-fit: cover; transition: opacity 0.12s; }
+.image-thumb-open:hover img { opacity: 0.85; }
+.image-badge {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: rgba(11, 11, 13, 0.82);
+  color: var(--text);
+  font: 600 10px/15px var(--mono);
+  pointer-events: none;
+}
+.image-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+.image-remove:hover { color: var(--danger); border-color: rgba(239, 107, 115, 0.5); }
+.image-thumb.is-pending { display: grid; place-items: center; border-style: dashed; color: var(--text-3); }
+
+/* No feed: tamanho fixo, para a imagem que carrega depois não empurrar a conversa. */
+.act-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.act-who + .act-images { margin-top: 2px; }
+.act-image {
+  display: block;
+  flex: none;
+  width: 136px;
+  height: 96px;
+  border-radius: 7px;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-3);
+  transition: border-color 0.12s;
+}
+.act-image img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.act-image:hover { border-color: var(--text-3); }
+.act-image.is-missing { display: grid; place-items: center; padding: 8px; border-style: dashed; background: none; color: var(--text-3); font-size: 11.5px; text-align: center; }
+
+/* Visualizador: por cima de modais e menus, abaixo dos avisos. */
+.viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(5, 5, 7, 0.86);
+  backdrop-filter: blur(3px);
+  animation: fade 0.15s ease;
+}
+.viewer { display: flex; flex-direction: column; align-items: center; gap: 10px; min-width: 0; max-width: 100%; }
+.viewer:focus { outline: none; }
+.viewer img {
+  display: block;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 96px);
+  object-fit: contain;
+  border-radius: 8px;
+  background: var(--bg-2);
+  box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.8);
+  animation: pop 0.16s ease;
+}
+.viewer-missing { padding: 48px 64px; border-radius: 10px; border: 1px dashed var(--border-strong); background: var(--bg-1); color: var(--text-3); }
+.viewer-bar { display: flex; align-items: center; gap: 2px; padding: 3px; border-radius: 9px; border: 1px solid var(--border-strong); background: var(--bg-1); }
+.viewer-count { min-width: 64px; padding: 0 8px; text-align: center; font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
 
 /* ---------------------------------------------------------------- mudanças */
 
@@ -121,6 +228,55 @@ select.input:disabled { cursor: default; opacity: 0.6; }
 .accounts-more { margin-top: -4px; font-size: 12.5px; color: var(--text-3); }
 .accounts-more summary { cursor: pointer; color: var(--text-2); width: fit-content; }
 .accounts-more[open] summary { margin-bottom: 4px; }
+
+/* Caixa de seleção com título e explicação embaixo. */
+.check-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.check-text strong { color: var(--text); font-weight: 600; }
+.check-text small { color: var(--text-3); font-size: 12px; line-height: 1.45; }
+.check input:disabled + .check-text strong { color: var(--text-3); }
+
+/* ---------------------------------------------------------------- worktrees */
+
+/* Ao delegar, logo abaixo da pasta. Os detalhes alinham com o texto da caixa de seleção. */
+.cwd-hint + .worktree-option { margin-top: -4px; }
+.worktree-option { display: flex; flex-direction: column; gap: 8px; }
+.worktree-details { display: flex; flex-direction: column; gap: 8px; margin-left: 30px; font-size: 12.5px; color: var(--text-2); }
+.worktree-base { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.worktree-base .segmented button { font-size: 12px; }
+.worktree-base + .field-hint { margin-top: -4px; }
+
+/* A branch de uma sessão num worktree, no cabeçalho dela. */
+.branch-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 260px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-2);
+  font: 11.5px var(--mono);
+}
+.branch-chip svg { flex: none; color: var(--agent); }
+.branch-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* O worktree foi removido (a branch continua): o chip fica apagado. */
+.branch-chip.is-gone { border-style: dashed; color: var(--text-3); }
+.branch-chip.is-gone svg { color: var(--text-3); }
+
+/* Pasta do agente num worktree: a coluna é estreita, então a branch vai para a linha de baixo (e quebra nos hífens). */
+.prop-btn.is-worktree { align-items: flex-start; white-space: normal; }
+.prop-btn.is-worktree > svg { flex: none; margin-top: 3px; color: var(--agent); }
+.prop-worktree { display: flex; flex-direction: column; min-width: 0; line-height: 1.35; overflow-wrap: anywhere; }
+.prop-worktree .dim { font-size: 11.5px; }
+
+/* Antes de remover: cada repositório do worktree, com as alterações sem commit e os commits da branch. */
+.worktree-repos { list-style: none; margin: 0 0 10px; padding: 0; border: 1px solid var(--border); border-radius: 8px; font-size: 12.5px; }
+.worktree-repos li { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; padding: 7px 10px; }
+.worktree-repos li + li { border-top: 1px solid var(--border); }
+.worktree-repos i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.worktree-repo-state { margin-left: auto; color: var(--text-3); }
+.confirm-body .composer-warning, .confirm-body .inline-error { margin-bottom: 10px; }
 
 /* ---------------------------------------------------------------- conectar pasta e repositórios */
 

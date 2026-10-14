@@ -21,7 +21,7 @@ Apenas a versão mais recente publicada em [Releases](https://github.com/KazuoMu
 **Janela do app**
 
 - A página roda isolada (`contextIsolation`, `sandbox`, sem acesso ao Node) e só navega dentro da própria interface. Links externos abrem no navegador.
-- Pedidos de permissão da página (câmera, microfone, localização, tela cheia e outros) são negados. Ficam liberadas só as notificações e a cópia para a área de transferência, e apenas para a interface do Octo.
+- Pedidos de permissão da página (câmera, microfone, localização, tela cheia e outros) são negados. Ficam liberadas só as notificações, a cópia para a área de transferência e a leitura dela (o Alt+V, que anexa a imagem copiada), e apenas para a interface do Octo.
 - As ferramentas de desenvolvedor não aparecem no app instalado. Para investigar um problema, abra o Octo com a variável `OCTO_DEVTOOLS=1`.
 
 **Executável (fuses do Electron)**
@@ -47,6 +47,7 @@ Limitação conhecida: com `runAsNode` ligado, outro programa do seu usuário co
 **Rede**
 
 - O Octo não envia seus dados a lugar nenhum: não há telemetria, analytics ou servidor remoto. A única conexão que ele faz por conta própria é consultar as releases deste repositório no GitHub para avisar de versões novas (pode ser desligada em Preferências).
+- Ao criar o worktree de uma issue a partir da branch padrão, o Octo roda `git ls-remote` e `git fetch` nos repositórios dela: o git conecta ao remoto `origin` com as credenciais que ele já usa, sem abrir pedido de senha (os programas de senha do git e do ssh ficam desligados nessas chamadas; sem rede ou sem login, o worktree sai da versão que já está no computador).
 
 **Instaladores**
 

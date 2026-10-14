@@ -242,8 +242,12 @@ for (const workspace of db.workspaces) {
   workspace.defaultPermissionMode = validMode(workspace.defaultPermissionMode);
   workspace.defaultModel ??= null;
   workspace.defaultEffort ??= null;
+  workspace.defaultWorktree ??= false;
 }
-for (const issue of db.issues) issue.reviewPending ??= false;
+for (const issue of db.issues) {
+  issue.reviewPending ??= false;
+  issue.worktree ??= null;
+}
 for (const session of db.sessions) {
   session.permissionMode = validMode(session.permissionMode);
   session.effort ??= null;

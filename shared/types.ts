@@ -95,6 +95,8 @@ export interface Workspace {
   defaultPermissionMode: PermissionMode;
   defaultModel: string | null;
   defaultEffort: Effort | null;
+  /** Ao delegar, já vem marcado "Trabalhar num worktree". */
+  defaultWorktree?: boolean;
   createdAt: string;
   scannedAt: string | null;
 }
@@ -170,10 +172,64 @@ export interface Issue {
    * quando a última terminar, seja como for (concluída, com erro ou interrompida).
    */
   reviewPending: boolean;
+  /** O worktree da issue, reaproveitado pelas próximas sessões dela até ser removido. */
+  worktree?: Worktree | null;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;
   history: HistoryEntry[];
+}
+
+// ---------------------------------------------------------------- worktrees
+
+/** De onde sai a branch de um worktree novo: a branch padrão do repositório (atualizada com git fetch) ou o que está aberto nele agora. */
+export type WorktreeBase = 'default' | 'current';
+
+/** Um repositório da issue no worktree: uma cópia de trabalho à parte, numa branch só dela. */
+export interface WorktreeRepo {
+  repoId: string;
+  /** Pasta do worktree: dentro de Worktree.root, no mesmo caminho relativo que o repositório tem no workspace. */
+  path: string;
+  branch: string;
+  /** De onde a branch saiu, como o git chama (origin/main, main ou o commit). */
+  base: string;
+}
+
+/** O worktree de uma issue: uma pasta que espelha o workspace, com um worktree git por repositório em foco. */
+export interface Worktree {
+  /** <dados>/worktrees/<workspace>/<issue>, ex.: ~/.octo/worktrees/redd/red-7 */
+  root: string;
+  repos: WorktreeRepo[];
+  createdAt: string;
+  /**
+   * Uma remoção começou e parou no meio (um arquivo preso por outro programa): o que sobrou está em
+   * `repos`. Até a remoção terminar, nenhuma sessão nova nem antiga roda nele.
+   */
+  removing?: boolean;
+}
+
+/** Como está um worktree no disco: mostrado antes de removê-lo. */
+export interface WorktreeStatus {
+  root: string;
+  exists: boolean;
+  /** Uma sessão em segundo plano roda nele agora: não dá para remover. */
+  busy: boolean;
+  repos: {
+    repoId: string;
+    name: string;
+    path: string;
+    branch: string;
+    exists: boolean;
+    /** Arquivos com alterações sem commit; null quando o git não respondeu. */
+    dirty: number | null;
+    /** Commits da branch que não estão na base; null quando o git não respondeu. */
+    ahead: number | null;
+  }[];
+  /**
+   * Arquivos do worktree fora dos repositórios (na raiz dele ou em pastas de grupo) que não são cópias
+   * iguais às da pasta original, como um PLANO.md que o agente escreveu ali: remover os perde. Até 20.
+   */
+  outside?: string[];
 }
 
 /** Estados de uma sessão de agente, inspirados no AgentSession do Linear. */
@@ -215,6 +271,11 @@ export interface AgentSession extends SessionSettings {
    * sessão. Com ele, a aba Mudanças marca `preexisting`. Ausente em sessões antigas.
    */
   baselineAt?: string | null;
+  /**
+   * O worktree em que a sessão roda (cópia do da issue quando ela começou): os repositórios dela
+   * estão nos caminhos do worktree, e não em Repo.absPath. Ausente fora de worktree.
+   */
+  worktree?: Worktree | null;
 }
 
 export type ActivityType = 'prompt' | 'thought' | 'message' | 'action' | 'result' | 'system' | 'error' | 'response';
@@ -233,6 +294,35 @@ export interface Activity {
   isError?: boolean;
   /** Repositórios afetados por esta ação. */
   repoIds?: string[];
+  /**
+   * Só em prompts: as imagens que foram junto, na ordem (#1, #2…). São nomes de arquivo em
+   * <dados>/images/<id da sessão>/, servidos em /api/sessions/<id da sessão>/images/<nome>.
+   */
+  images?: string[];
+}
+
+// ---------------------------------------------------------------- imagens na conversa
+
+/** Formatos de imagem que o Claude aceita numa mensagem. */
+export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] as const;
+export type ImageType = (typeof IMAGE_TYPES)[number];
+
+/** Até quantas imagens vão numa mensagem. */
+export const MAX_IMAGES = 10;
+
+/** Tamanho máximo de cada imagem já em base64: o limite da API da Anthropic é 5 MB por imagem. */
+export const MAX_IMAGE_BASE64 = 5 * 1024 * 1024;
+
+/**
+ * Soma das imagens de uma mensagem, em base64. A API recusa requisições acima de 32 MB, e as perguntas
+ * seguintes da conversa levam junto as imagens anteriores: o teto deixa folga para isso.
+ */
+export const MAX_IMAGES_TOTAL_BASE64 = 20 * 1024 * 1024;
+
+/** Imagem colada, arrastada ou escolhida na interface: o conteúdo em base64, sem o prefixo "data:". */
+export interface ImageInput {
+  mediaType: ImageType;
+  data: string;
 }
 
 export interface AppState {

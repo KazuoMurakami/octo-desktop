@@ -683,6 +683,8 @@ textarea {
 .desc-input:focus { border: 0; }
 
 .delegate { display: flex; flex-direction: column; gap: 14px; }
+/* O formulário de delegar é um fieldset (trava tudo de uma vez enquanto delega), sem a moldura padrão dele. */
+fieldset.delegate { border: 0; margin: 0; padding: 0; min-width: 0; }
 .mode-pick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .mode-pick button {
   display: flex;
@@ -1174,7 +1176,7 @@ a.md-image:hover { color: var(--text); border-color: var(--focus); }
 .slash-menu {
   position: absolute;
   left: 0;
-  right: 110px;
+  right: 148px;
   bottom: calc(100% + 6px);
   z-index: 20;
   padding: 4px;

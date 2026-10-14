@@ -6,16 +6,18 @@ import { createInterface } from 'node:readline';
 import {
   EFFORT_LABEL, PERMISSION_LABEL,
   type Activity, type AgentSession, type ClaudeAccount, type Issue, type PermissionDenial, type PermissionMode, type Repo, type SessionSettings,
-  type Workspace,
+  type Workspace, type Worktree,
 } from '../shared/types.ts';
 import { dirtyEntries } from './changes.ts';
 import { claudeEnv, requireClaude, type ClaudeCommand } from './claude.ts';
 import { broadcast } from './events.ts';
+import { imageBlocks, saveImages, saveTranscriptImages, type ParsedImage } from './images.ts';
 import { HttpError, addHistory, commitIssue, commitSession, now, requireFolder, workspaceRepos } from './model.ts';
 import { describeRepos } from './scanner.ts';
 import { appendActivity, db, readActivities, save, writeActivities, writeBaseline } from './store.ts';
 import { describeSpawnError, fitsCommandLine, shrinkToFit } from './system.ts';
 import { openClaudeTerminal } from './terminal.ts';
+import { sessionRepos, worktreeCwd } from './worktrees.ts';
 
 interface Run {
   child: ChildProcess;
@@ -25,6 +27,9 @@ interface Run {
   lastMessage: Activity | null;
   /** SIGKILL agendado depois do Parar (macOS/Linux), caso o processo não saia sozinho. */
   killTimer: NodeJS.Timeout | null;
+  /** Resolve quando o processo termina de vez (depois do resultado, ele ainda roda os hooks do fim e grava o transcript). */
+  closed: Promise<void>;
+  markClosed: () => void;
 }
 
 const runs = new Map<string, Run>();
@@ -40,6 +45,24 @@ export function isRunning(sessionId: string): boolean {
 function working(sessionId: string): boolean {
   const run = runs.get(sessionId);
   return Boolean(run && !run.gotResult);
+}
+
+export { working as isWorking };
+
+/** Quanto esperar o Claude sair depois de já ter respondido (hooks do fim da sessão, gravação do transcript). */
+const EXIT_GRACE = 20_000;
+
+/**
+ * Uma execução que já respondeu, mas cujo processo ainda está saindo: espera ele terminar (até
+ * EXIT_GRACE), em vez de recusar quem responde logo depois da resposta aparecer. Com o Claude ainda
+ * trabalhando (ou sem execução), volta na hora.
+ */
+export async function settleRun(sessionId: string): Promise<void> {
+  const run = runs.get(sessionId);
+  if (!run?.gotResult) return;
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([run.closed, new Promise<void>((resolve) => (timer = setTimeout(resolve, EXIT_GRACE)))]);
+  clearTimeout(timer);
 }
 
 // ---------------------------------------------------------------- prompts
@@ -77,20 +100,26 @@ function relFrom(cwd: string, target: string): string {
 }
 
 /** Contexto anexado ao system prompt: é o que dá ao Claude a visão de todos os repos de uma vez. */
-export function workspaceSystemPrompt(workspace: Workspace, cwd: string): string {
-  const repos = workspaceRepos(workspace.id);
+export function workspaceSystemPrompt(workspace: Workspace, cwd: string, worktree: Worktree | null = null): string {
+  // Num worktree, os repositórios dele aparecem nos caminhos (e na branch) do worktree; os outros, na pasta original.
+  const repos = sessionRepos({ workspaceId: workspace.id, worktree });
   const inside = repos.filter((r) => isInside(cwd, r.absPath));
   const outside = repos.filter((r) => !isInside(cwd, r.absPath));
   const describe = (repo: Repo) => {
     const bits = [repo.stack.slice(0, 4).join(', '), repo.branch && `branch ${repo.branch}`].filter(Boolean).join(' · ');
     return `- ${repo.name}: ${relFrom(cwd, repo.absPath)}${bits ? ` (${bits})` : ''}`;
   };
-  const atRoot = samePath(cwd, workspace.rootPath);
+  const atRoot = samePath(cwd, worktree?.root ?? workspace.rootPath);
+  const where = worktree
+    ? atRoot
+      ? `O diretório atual é a raiz do worktree da issue, que espelha o workspace "${workspace.name}" (pasta original: ${workspace.rootPath}). Ele contém ${inside.length} repositório(s) git independente(s) (não é um monorepo):`
+      : `O diretório atual (${relFrom(worktree.root, cwd)} no worktree da issue, que espelha o workspace "${workspace.name}"; pasta original: ${workspace.rootPath}) contém ${inside.length} repositório(s) git independente(s):`
+    : atRoot
+      ? `O diretório atual é a RAIZ do workspace "${workspace.name}", uma pasta com ${repos.length} repositórios git independentes (não é um monorepo):`
+      : `O diretório atual (${relFrom(workspace.rootPath, cwd)} dentro do workspace "${workspace.name}", raiz ${workspace.rootPath}) contém ${inside.length} repositório(s) git independente(s):`;
   return [
     'Você foi iniciado pelo Octo, um gerenciador local de issues.',
-    atRoot
-      ? `O diretório atual é a RAIZ do workspace "${workspace.name}", uma pasta com ${repos.length} repositórios git independentes (não é um monorepo):`
-      : `O diretório atual (${relFrom(workspace.rootPath, cwd)} dentro do workspace "${workspace.name}", raiz ${workspace.rootPath}) contém ${inside.length} repositório(s) git independente(s):`,
+    where,
     ...inside.map(describe),
     ...(outside.length ? ['', `Outros repositórios do workspace, fora da pasta atual: ${outside.map((r) => r.name).join(', ')}.`] : []),
     '',
@@ -101,8 +130,24 @@ export function workspaceSystemPrompt(workspace: Workspace, cwd: string): string
     '- Não faça commit, push ou operações destrutivas a menos que a issue peça explicitamente.',
     '- Ao terminar, responda com um resumo curto: o que mudou em cada repositório e os próximos passos.',
     '- Responda em português do Brasil.',
+    // Antes das diretrizes: se o contexto não couber na linha de comando do terminal, o corte começa pelo fim.
+    ...(worktree ? ['', ...worktreeRules(workspace, worktree)] : []),
     workspace.guidance.trim() ? `\nDiretrizes do workspace definidas pelo usuário:\n${workspace.guidance.trim()}` : '',
   ].join('\n');
+}
+
+/** Regras de uma sessão num worktree: onde trabalhar e o que não veio da pasta original. */
+function worktreeRules(workspace: Workspace, worktree: Worktree): string[] {
+  const branches = [...new Set(worktree.repos.map((entry) => entry.branch))];
+  const originals = workspaceRepos(workspace.id).filter((r) => worktree.repos.some((entry) => entry.repoId === r.id)).map((r) => r.absPath);
+  return [
+    'Regras do worktree:',
+    `- Esta sessão roda num worktree git que o Octo criou para a issue, em ${worktree.root}: cada repositório aqui é uma cópia de trabalho à parte, ${branches.length === 1 ? `na branch ${branches[0]}` : `nas branches ${branches.join(', ')}`}, e a pasta original dele não é afetada.`,
+    `- Trabalhe só dentro do worktree.${originals.length ? ` Nunca mexa nas pastas originais dos repositórios: ${originals.join(', ')}.` : ''}`,
+    '- Não troque de branch (git checkout/switch) nem remova o worktree.',
+    '- Arquivos fora do git (node_modules, .env, builds) não vêm junto: instale as dependências aqui antes de rodar scripts. Se faltar um .env necessário, avise o usuário (o .worktreeinclude de um repositório lista os arquivos ignorados que são copiados para worktrees novos).',
+    '- CLAUDE.md, AGENTS.md, .mcp.json e .claude/ fora dos repositórios são cópias dos originais do workspace, só para contexto: mudanças neles não voltam para o workspace.',
+  ];
 }
 
 export function issuePrompt(issue: Issue, repos: Repo[], cwd: string, extra: string): string {
@@ -141,9 +186,9 @@ function normalize(p: string): string {
   return process.platform === 'win32' ? s.toLowerCase() : s;
 }
 
-/** Mapeia caminhos/comandos de uma ferramenta para os repositórios tocados. */
+/** Mapeia caminhos/comandos de uma ferramenta para os repositórios tocados (num worktree, pelos caminhos dele). */
 function touchedRepos(session: AgentSession, input: Record<string, any>): string[] {
-  const repos = workspaceRepos(session.workspaceId);
+  const repos = sessionRepos(session);
   const ids = new Set<string>();
   for (const key of ['file_path', 'path', 'notebook_path']) {
     const value = input[key];
@@ -398,13 +443,24 @@ interface StartOptions {
   extraInstructions: string;
   /** Pasta da sessão; por padrão, a menor pasta comum aos repositórios da issue. */
   cwd?: string;
+  /** Imagens que vão junto do prompt (só em segundo plano). */
+  images?: ParsedImage[];
+  /** Worktree em que a sessão roda (ver prepareWorktree); sem ele, a pasta original dos repositórios. */
+  worktree?: Worktree | null;
+  /** Avisos que entram no feed quando a sessão começa (ex.: como o worktree foi preparado). */
+  notes?: string[];
+  /** ID da sessão, quando quem delega já gravou as imagens dela (ver savedImages). */
+  sessionId?: string;
+  /** As imagens já gravadas com sessionId (os nomes, na ordem): saveImages não roda de novo. */
+  savedImages?: string[];
 }
 
 function createSession(options: StartOptions, mode: AgentSession['mode']): AgentSession {
-  const cwd = options.cwd ?? sessionCwd(options.workspace, options.issue?.repoIds ?? []);
+  const repoIds = options.issue?.repoIds ?? [];
+  const cwd = options.cwd ?? (options.worktree ? worktreeCwd(options.worktree, repoIds) : sessionCwd(options.workspace, repoIds));
   const title = options.issue ? `${options.issue.identifier} · ${options.issue.title}` : `Sessão em ${path.basename(cwd)}`;
   const session: AgentSession = {
-    id: randomUUID(),
+    id: options.sessionId ?? randomUUID(),
     workspaceId: options.workspace.id,
     issueId: options.issue?.id ?? null,
     accountId: options.account.id,
@@ -424,6 +480,8 @@ function createSession(options: StartOptions, mode: AgentSession['mode']): Agent
     pendingDenials: [],
     lastError: null,
   };
+  // Uma cópia: o que mudar depois no worktree da issue (um repositório a mais, a remoção) não reescreve esta sessão.
+  if (options.worktree) session.worktree = { ...options.worktree, repos: options.worktree.repos.map((entry) => ({ ...entry })) };
   return session;
 }
 
@@ -445,8 +503,25 @@ function missingFolder(cwd: string): string {
 }
 
 /** Sessão que já existe: a pasta dela é fixa desde o início, então reescanear o workspace não resolve. */
-function missingSessionFolder(cwd: string): string {
-  return `A pasta desta sessão não existe mais: ${cwd}. Ela pode ter sido movida, renomeada ou apagada. Para continuar esta conversa, devolva a pasta a esse caminho; se não der, comece uma nova sessão.`;
+function requireSessionFolder(session: AgentSession): void {
+  const worktree = session.worktree;
+  if (!worktree) {
+    requireFolder(
+      session.cwd,
+      `A pasta desta sessão não existe mais: ${session.cwd}. Ela pode ter sido movida, renomeada ou apagada. Para continuar esta conversa, devolva a pasta a esse caminho; se não der, comece uma nova sessão.`,
+    );
+    return;
+  }
+  const issue = db.issues.find((i) => i.id === session.issueId);
+  // Sem a issue (excluída, o que só acontece depois de o worktree dela sair), não há o que delegar de novo.
+  const removed = session.issueId && !issue
+    ? `A issue desta sessão foi excluída, e o worktree dela (${worktree.root}) saiu junto. Para continuar o trabalho, comece uma nova sessão.`
+    : `O worktree desta sessão foi removido (${worktree.root}). Para continuar, delegue a issue de novo: num worktree novo ou na pasta original dos repositórios.`;
+  // Removido e criado de novo no mesmo caminho, é outro worktree (com outra branch): a conversa não segue nele.
+  if (issue?.worktree && samePath(issue.worktree.root, worktree.root) && (issue.worktree.createdAt !== worktree.createdAt || issue.worktree.removing)) {
+    throw new HttpError(400, removed);
+  }
+  requireFolder(session.cwd, removed);
 }
 
 export function startHeadless(options: StartOptions): AgentSession {
@@ -454,37 +529,49 @@ export function startHeadless(options: StartOptions): AgentSession {
   const claude = requireClaude();
   const session = createSession(options, 'headless');
   requireFolder(session.cwd, missingFolder(session.cwd));
-  const repos = workspaceRepos(options.workspace.id);
-  const prompt = options.issue ? issuePrompt(options.issue, repos, session.cwd, options.extraInstructions) : options.extraInstructions;
+  const prompt = options.issue ? issuePrompt(options.issue, sessionRepos(session), session.cwd, options.extraInstructions) : options.extraInstructions;
   const plan = planRun(
     claude,
     session,
     prompt,
     ['--session-id', session.claudeSessionId, '--name', session.title.slice(0, 80)],
     [],
-    workspaceSystemPrompt(options.workspace, session.cwd),
+    workspaceSystemPrompt(options.workspace, session.cwd, session.worktree),
+    options.images,
   );
+  plan.images = options.savedImages ?? saveImages(session.id, options.images ?? []);
 
   db.sessions.push(session);
   if (options.issue) markDelegated(options.issue, options.account, 'iniciou uma sessão em segundo plano');
+  // Os avisos (ex.: o worktree criado) ficam acima do prompt.
+  for (const text of options.notes ?? []) emit(session, { type: 'system', text });
   void recordBaseline(session);
   launchRun(session, options.account, plan);
   return session;
 }
 
 /** Continua a conversa; `changes` troca modelo, effort etc. a partir desta mensagem (como o /model do CLI). */
-export function sendMessage(session: AgentSession, text: string, allowedTools: string[], changes: Partial<SessionSettings> = {}): void {
+export async function sendMessage(
+  session: AgentSession,
+  text: string,
+  allowedTools: string[],
+  changes: Partial<SessionSettings> = {},
+  images: ParsedImage[] = [],
+): Promise<void> {
+  await settleRun(session.id);
   if (runs.has(session.id)) throw new HttpError(409, 'A sessão ainda está em execução.');
   if (opening.has(session.id)) throw new HttpError(409, 'A sessão está sendo aberta no terminal. Espere a janela abrir antes de responder por aqui.');
   const account = db.accounts.find((a) => a.id === session.accountId);
   if (!account) throw new HttpError(400, 'A conta desta sessão foi removida.');
   const claude = requireClaude();
-  requireFolder(session.cwd, missingSessionFolder(session.cwd));
+  requireSessionFolder(session);
   // Aberta no terminal (mesmo se já marcada como concluída): a janela pode continuar aberta nesta
   // mesma conversa, e dois processos gravando o mesmo histórico o embaralham. Em segundo plano, a
   // conversa segue num ramo novo (--fork-session), com todo o histórico; o ID novo chega no evento de início.
   const fork = session.mode === 'terminal';
-  const plan = planRun(claude, { ...session, ...changes }, text, ['--resume', session.claudeSessionId, ...(fork ? ['--fork-session'] : [])], allowedTools, null);
+  const plan = planRun(claude, { ...session, ...changes }, text, ['--resume', session.claudeSessionId, ...(fork ? ['--fork-session'] : [])], allowedTools, null, images);
+  // As imagens vão para o disco antes de mexer na sessão: se a gravação falhar, nada muda.
+  plan.images = saveImages(session.id, images);
 
   Object.assign(session, changes);
   session.pendingDenials = [];
@@ -521,27 +608,46 @@ interface RunPlan {
   /** O prompt como aparece no feed. */
   prompt: string;
   allowedTools: string[];
+  /** Imagens que foram junto, para o feed: os nomes gravados por saveImages depois de planejar. */
+  images: string[];
 }
 
 /**
  * Monta os argumentos e confere o limite da linha de comando do sistema (32.767 caracteres no
  * Windows) antes de qualquer mudança de estado. O contexto do workspace vai no system prompt;
  * se não couber (ex.: diretrizes muito longas), segue junto do prompt pelo stdin, que não tem limite.
+ * Com imagens, o stdin leva uma mensagem em JSON (--input-format stream-json): as imagens e, por
+ * último, o mesmo texto que iria sozinho.
  */
-function planRun(claude: ClaudeCommand, session: AgentSession, prompt: string, extraArgs: string[], allowedTools: string[], context: string | null): RunPlan {
-  const base = [...claude.prefixArgs, '-p', '--output-format', 'stream-json', '--verbose', ...settingsArgs(session, true), ...extraArgs];
+function planRun(
+  claude: ClaudeCommand,
+  session: AgentSession,
+  prompt: string,
+  extraArgs: string[],
+  allowedTools: string[],
+  context: string | null,
+  images: ParsedImage[] = [],
+): RunPlan {
+  const inputFormat = images.length ? ['--input-format', 'stream-json'] : [];
+  const base = [...claude.prefixArgs, '-p', '--output-format', 'stream-json', '--verbose', ...inputFormat, ...settingsArgs(session, true), ...extraArgs];
   // --allowedTools aceita vários valores: fica por último.
   const tools = allowedTools.length ? ['--allowedTools', ...allowedTools] : [];
-  const plan = { command: claude.command, prompt, allowedTools };
+  const plan = { command: claude.command, prompt, allowedTools, images: [] };
+  const stdin = (text: string) => (images.length ? userMessage(images, text) : text);
   if (context) {
     const args = [...base, '--append-system-prompt', context, ...tools];
-    if (fitsCommandLine(claude.command, args)) return { ...plan, args, input: prompt };
+    if (fitsCommandLine(claude.command, args)) return { ...plan, args, input: stdin(prompt) };
   }
   const args = [...base, ...tools];
   if (!fitsCommandLine(claude.command, args)) {
     throw new HttpError(400, 'As ações liberadas formam um comando longo demais para o sistema. Libere menos ações de uma vez, ou responda sem liberar.');
   }
-  return { ...plan, args, input: context ? `${context}\n\n---\n\n${prompt}` : prompt };
+  return { ...plan, args, input: stdin(context ? `${context}\n\n---\n\n${prompt}` : prompt) };
+}
+
+/** Mensagem do usuário no formato do --input-format stream-json: uma linha JSON, com o conteúdo em blocos. */
+function userMessage(images: ParsedImage[], text: string): string {
+  return `${JSON.stringify({ type: 'user', message: { role: 'user', content: imageBlocks(images, text) }, parent_tool_use_id: null })}\n`;
 }
 
 /** Exceções aqui (num evento do processo) derrubariam o servidor: viram só um registro no console. */
@@ -554,7 +660,12 @@ function guarded(action: () => void): void {
 }
 
 function launchRun(session: AgentSession, account: ClaudeAccount, plan: RunPlan): void {
-  emit(session, { type: 'prompt', text: plan.prompt, detail: plan.allowedTools.length ? `Permitido: ${plan.allowedTools.join(', ')}` : undefined });
+  emit(session, {
+    type: 'prompt',
+    text: plan.prompt,
+    detail: plan.allowedTools.length ? `Permitido: ${plan.allowedTools.join(', ')}` : undefined,
+    images: plan.images.length ? plan.images : undefined,
+  });
   session.state = 'active';
   session.endedAt = null;
   session.lastError = null;
@@ -579,7 +690,9 @@ function launchRun(session: AgentSession, account: ClaudeAccount, plan: RunPlan)
     onSessionSettled(session);
     return;
   }
-  const state: Run = { child, stopped: false, gotResult: false, stderr: '', lastMessage: null, killTimer: null };
+  let markClosed = () => {};
+  const closed = new Promise<void>((resolve) => (markClosed = resolve));
+  const state: Run = { child, stopped: false, gotResult: false, stderr: '', lastMessage: null, killTimer: null, closed, markClosed };
   runs.set(session.id, state);
 
   // Se o Claude sair antes de ler tudo (ex.: uma opção que a versão instalada não conhece, ou o
@@ -604,6 +717,7 @@ function launchRun(session: AgentSession, account: ClaudeAccount, plan: RunPlan)
 }
 
 function finish(session: AgentSession, state: Run, code: number | null, spawnError: string | null): void {
+  state.markClosed();
   if (state.killTimer) clearTimeout(state.killTimer);
   if (runs.get(session.id) !== state) return;
   runs.delete(session.id);
@@ -715,16 +829,23 @@ function fitTerminalArgs(claude: ClaudeCommand, options: string[], context: stri
   throw new HttpError(400, 'O comando para abrir o Claude ficou longo demais para o sistema. Encurte as diretrizes do workspace ou use “Delegar” em segundo plano.');
 }
 
+/** No terminal o prompt vai na linha de comando, que só leva texto: imagens só vão em segundo plano. */
+export function refuseTerminalImages(images: ParsedImage[] = []): void {
+  if (images.length) {
+    throw new HttpError(400, 'As imagens só vão junto em segundo plano. No terminal, cole a imagem direto no Claude: Alt+V no Windows, Ctrl+V no macOS e no Linux.');
+  }
+}
+
 export async function startInTerminal(options: StartOptions): Promise<AgentSession> {
+  refuseTerminalImages(options.images);
   const claude = requireClaude();
   const session = createSession(options, 'terminal');
   requireFolder(session.cwd, missingFolder(session.cwd));
-  const repos = workspaceRepos(options.workspace.id);
-  const prompt = options.issue ? issuePrompt(options.issue, repos, session.cwd, options.extraInstructions) : options.extraInstructions;
+  const prompt = options.issue ? issuePrompt(options.issue, sessionRepos(session), session.cwd, options.extraInstructions) : options.extraInstructions;
   const { args, promptCut, contextCut } = fitTerminalArgs(
     claude,
     [...settingsArgs(session, false), '--session-id', session.claudeSessionId, '--name', session.title.slice(0, 80)],
-    workspaceSystemPrompt(options.workspace, session.cwd),
+    workspaceSystemPrompt(options.workspace, session.cwd, session.worktree),
     prompt,
   );
   const warnings = [
@@ -742,6 +863,8 @@ export async function startInTerminal(options: StartOptions): Promise<AgentSessi
   // Só registra depois que o terminal abriu de fato.
   db.sessions.push(session);
   if (options.issue) markDelegated(options.issue, options.account, 'abriu uma sessão no terminal');
+  // Como em segundo plano: os avisos (ex.: o worktree criado) ficam acima do prompt.
+  for (const text of options.notes ?? []) emit(session, { type: 'system', text });
   emit(session, { type: 'prompt', text: prompt || '_Sessão interativa aberta no terminal._' });
   if (promptCut) {
     emit(session, {
@@ -762,11 +885,12 @@ export async function startInTerminal(options: StartOptions): Promise<AgentSessi
 }
 
 export async function resumeInTerminal(session: AgentSession): Promise<void> {
+  await settleRun(session.id);
   if (runs.has(session.id)) throw new HttpError(409, 'Pare a execução em segundo plano antes de abrir no terminal.');
   if (opening.has(session.id)) throw new HttpError(409, 'A sessão já está sendo aberta no terminal.');
   const account = db.accounts.find((a) => a.id === session.accountId);
   if (!account) throw new HttpError(400, 'A conta desta sessão foi removida.');
-  requireFolder(session.cwd, missingSessionFolder(session.cwd));
+  requireSessionFolder(session);
   // Enquanto a janela abre (no iTerm, até a permissão de Automação), uma resposta por aqui rodaria
   // em segundo plano na mesma conversa que o terminal vai retomar: sendMessage recusa.
   opening.add(session.id);
@@ -794,7 +918,7 @@ export async function resumeInTerminal(session: AgentSession): Promise<void> {
 /** Repositórios cujo estado inicial importa para a aba Mudanças: os da issue primeiro, depois os da pasta. */
 function baselineRepos(session: AgentSession): Repo[] {
   const issue = session.issueId ? db.issues.find((i) => i.id === session.issueId) : null;
-  const inScope = workspaceRepos(session.workspaceId).filter((r) => isInside(session.cwd, r.absPath));
+  const inScope = sessionRepos(session).filter((r) => isInside(session.cwd, r.absPath));
   const focused = inScope.filter((r) => issue?.repoIds.includes(r.id));
   return [...new Set([...focused, ...inScope])].slice(0, 40);
 }
@@ -827,6 +951,8 @@ async function recordBaseline(session: AgentSession): Promise<void> {
  * commit): a tela de Repositórios não fica mostrando "limpo" num repo que o agente acabou de editar.
  */
 async function refreshTouchedRepos(session: AgentSession): Promise<void> {
+  // Num worktree, quem mudou foi a cópia de trabalho dele: a pasta original dos repositórios continua igual.
+  if (session.worktree) return;
   const workspace = db.workspaces.find((w) => w.id === session.workspaceId);
   if (!workspace) return;
   const issue = session.issueId ? db.issues.find((i) => i.id === session.issueId) : null;
@@ -888,6 +1014,9 @@ export function syncFromTranscript(session: AgentSession): number {
   return activities.length;
 }
 
+/** Rótulo antes de cada imagem numa mensagem: "[Imagem #1]" nas do Octo, "[Image #1]" nas do Claude Code. */
+const IMAGE_LABEL = /^\[(Imagem|Image) #\d+\]$/;
+
 function fromTranscriptEntry(session: AgentSession, entry: any): Activity[] {
   const base = { sessionId: session.id, ts: entry.timestamp ?? now() };
   const content = entry.message?.content;
@@ -898,11 +1027,24 @@ function fromTranscriptEntry(session: AgentSession, entry: any): Activity[] {
   }
   if (!Array.isArray(content)) return [];
   const out: Activity[] = [];
+  // Na mensagem do usuário, os textos e as imagens coladas viram um prompt só, no lugar do primeiro deles.
+  const prompt = { at: -1, id: '', texts: [] as string[], images: [] as unknown[] };
   content.forEach((block: any, index: number) => {
     const id = `${entry.uuid ?? randomUUID()}:${index}`;
-    if (block.type === 'text' && block.text?.trim()) {
-      if (entry.type === 'user' && block.text.trimStart().startsWith('<')) return;
-      out.push({ ...base, id, type: entry.type === 'user' ? 'prompt' : 'message', text: block.text });
+    if (entry.type === 'user' && (block.type === 'text' || block.type === 'image')) {
+      if (block.type === 'text') {
+        const text = typeof block.text === 'string' ? block.text : '';
+        if (!text.trim() || text.trimStart().startsWith('<') || IMAGE_LABEL.test(text.trim())) return;
+        prompt.texts.push(text);
+      } else {
+        prompt.images.push(block);
+      }
+      if (prompt.at < 0) {
+        prompt.at = out.length;
+        prompt.id = id;
+      }
+    } else if (block.type === 'text' && block.text?.trim()) {
+      out.push({ ...base, id, type: 'message', text: block.text });
     } else if (block.type === 'thinking' && block.thinking?.trim()) {
       out.push({ ...base, id, type: 'thought', text: block.thinking });
     } else if (block.type === 'tool_use') {
@@ -915,5 +1057,9 @@ function fromTranscriptEntry(session: AgentSession, entry: any): Activity[] {
       out.push({ ...base, id, type: 'result', toolUseId: block.tool_use_id, text: clip(resultText(block.content), 4000), isError: Boolean(block.is_error) });
     }
   });
+  const images = saveTranscriptImages(session.id, prompt.images);
+  if (prompt.texts.length || images.length) {
+    out.splice(prompt.at, 0, { ...base, id: prompt.id, type: 'prompt', text: prompt.texts.join('\n\n'), images: images.length ? images : undefined });
+  }
   return out;
 }

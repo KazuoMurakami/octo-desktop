@@ -50,18 +50,22 @@ export function isUnder(dir: string, target: string): boolean {
   return b === a || b.startsWith(`${a}\\`) || b.startsWith(`${a}/`);
 }
 
-/** Mesma regra do servidor: a sessão roda na menor pasta que contém os repositórios da issue. */
-export function commonFolder(workspace: Workspace, repos: Repo[]): string {
-  if (!repos.length) return workspace.rootPath;
-  const s = sep(workspace.rootPath);
-  let common = repos[0].absPath.split(/[\\/]/);
-  for (const repo of repos.slice(1)) {
-    const parts = repo.absPath.split(/[\\/]/);
+/** A menor pasta que contém todas estas; sem nenhuma (ou sem nada em comum), `fallback`. */
+export function smallestFolder(dirs: string[], fallback: string): string {
+  if (!dirs.length) return fallback;
+  let common = dirs[0].split(/[\\/]/);
+  for (const dir of dirs.slice(1)) {
+    const parts = dir.split(/[\\/]/);
     let i = 0;
     while (i < common.length && i < parts.length && common[i].toLowerCase() === parts[i].toLowerCase()) i++;
     common = common.slice(0, i);
   }
-  const joined = common.join(s);
+  return common.join(sep(fallback)) || fallback;
+}
+
+/** Mesma regra do servidor: a sessão roda na menor pasta que contém os repositórios da issue. */
+export function commonFolder(workspace: Workspace, repos: Repo[]): string {
+  const joined = smallestFolder(repos.map((repo) => repo.absPath), workspace.rootPath);
   return joined.toLowerCase().startsWith(workspace.rootPath.toLowerCase()) ? joined : workspace.rootPath;
 }
 
