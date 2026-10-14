@@ -2,7 +2,7 @@
 // Arquivos são lidos e escritos direto na pasta da conta; MCP e plugins passam pelo próprio `claude`,
 // que conhece o formato e as regras de cada um.
 import { execFile } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -12,6 +12,7 @@ import type {
 import { claudeEnv, requireClaude } from './claude.ts';
 import { HttpError } from './model.ts';
 import { DATA_DIR } from './paths.ts';
+import { copyTree, describeSpawnError } from './system.ts';
 
 export function configDir(account: ClaudeAccount): string {
   return account.configDir ?? path.join(homedir(), '.claude');
@@ -43,7 +44,8 @@ function runClaude(account: ClaudeAccount, args: string[], timeout = 120_000): P
       (error, stdout, stderr) => {
         if (!error) return resolve(stdout.toString());
         const output = `${stderr}\n${stdout}`.trim();
-        reject(new HttpError(400, output.split('\n').slice(-4).join('\n') || error.message));
+        const fallback = error.killed ? 'O Claude Code não respondeu a tempo.' : describeSpawnError(error, 'O Claude Code falhou');
+        reject(new HttpError(400, output.split('\n').slice(-4).join('\n') || fallback));
       },
     );
   });
@@ -369,7 +371,9 @@ export async function deleteItem(account: ClaudeAccount, file: unknown, projectD
   try {
     renameSync(from, to);
   } catch {
-    cpSync(from, to, { recursive: true });
+    // Outro disco (ou arquivo preso): copia e só apaga o original se a cópia existir de fato.
+    copyTree(from, to);
+    if (!existsSync(to)) throw new HttpError(500, 'Não foi possível mover o item para a lixeira do Octo; nada foi apagado.');
     await rm(from, { recursive: true, force: true });
   }
   return to;
@@ -382,5 +386,5 @@ export async function copyItem(account: ClaudeAccount, file: unknown, target: Cl
   const to = item.kind === 'skill' ? path.dirname(newItemPath(configDir(target), 'skill', name)) : newItemPath(configDir(target), item.kind, name);
   if (existsSync(to)) throw new HttpError(400, `A conta de destino já tem ${item.kind === 'skill' ? 'uma skill' : 'um item'} "${name}".`);
   mkdirSync(path.dirname(to), { recursive: true });
-  cpSync(from, to, { recursive: true });
+  copyTree(from, to);
 }

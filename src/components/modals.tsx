@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, Code2, FileDiff, FileText, FolderGit2, FolderSearch, Settings2, SquareTerminal } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Bot, Code2, FileDiff, FileText, FolderGit2, FolderSearch, LogIn, Settings2, SquareTerminal } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   PRIORITY_LABEL, STATUSES, STATUS_LABEL,
@@ -8,9 +8,11 @@ import {
 import { api, settingsInput, type ContextInfo, type FolderInspection } from '../api.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { useIntegrations } from '../integrations.ts';
-import { commonFolder, hue, relativeTo } from '../util.ts';
+import { commonFolder, hue, modKey, relativeTo } from '../util.ts';
+import { loginHint, startLogin } from './AccountsView.tsx';
 import { ChangesView } from './ChangesView.tsx';
 import { AccountAvatar, PriorityIcon, StatusIcon } from './icons.tsx';
+import { folderLabel } from './OpenMenu.tsx';
 import { SessionSettingsForm } from './SessionSettings.tsx';
 import { AutoTextarea, Field, Kbd, Menu, Modal, RepoChip } from './ui.tsx';
 
@@ -40,29 +42,79 @@ export function Modals() {
   }
 }
 
+// ---------------------------------------------------------------- confirmação de ações destrutivas
+
+/**
+ * Pergunta antes de uma ação que não dá para desfazer, dizendo o que vai acontecer. O foco começa
+ * em "Cancelar": um Enter distraído não apaga nada. Aberta sobre outro modal ou sobre o painel da
+ * issue, o Esc fecha só ela (é a camada de cima).
+ */
+export function ConfirmDialog({ title, children, confirmLabel, busyLabel = 'Aguarde…', tone = 'danger', onConfirm, onClose }: {
+  title: ReactNode;
+  children: ReactNode;
+  confirmLabel: string;
+  busyLabel?: string;
+  tone?: 'danger' | 'primary';
+  /** Pode ser assíncrona: o diálogo espera e só fecha se der certo (o erro já vira aviso em api.ts). */
+  onConfirm: () => unknown;
+  onClose: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const confirm = async () => {
+    setBusy(true);
+    try {
+      await onConfirm();
+    } catch {
+      setBusy(false);
+      return;
+    }
+    onClose();
+  };
+
+  return (
+    <Modal
+      width={480}
+      title={title}
+      onClose={() => !busy && onClose()}
+      footer={
+        <>
+          <button className="ghost-btn" autoFocus onClick={onClose} disabled={busy}>Cancelar</button>
+          <button className={tone === 'danger' ? 'danger-btn' : 'primary-btn'} onClick={() => void confirm()} disabled={busy}>
+            {busy ? busyLabel : confirmLabel}
+          </button>
+        </>
+      }
+    >
+      <div className="confirm-body">{children}</div>
+    </Modal>
+  );
+}
+
 // ---------------------------------------------------------------- nova issue
 
 function NewIssueModal({ status: initialStatus, repoIds: initialRepos, onClose }: { status?: IssueStatus; repoIds?: string[]; onClose: () => void }) {
   const workspace = useWorkspace();
   const repos = useWorkspaceRepos();
-  const accounts = useStore((s) => s.accounts);
+  const { accounts, accountStatus } = useStore(useShallow((s) => ({ accounts: s.accounts, accountStatus: s.accountStatus })));
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [status, setStatus] = useState<IssueStatus>(initialStatus ?? 'todo');
   const [priority, setPriority] = useState<Priority>(0);
   const [repoIds, setRepoIds] = useState<string[]>(initialRepos ?? []);
-  const [delegateId, setDelegateId] = useState<string | null>(null);
+  const [accountId, setAccountId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   if (!workspace) return null;
   const selected = repos.filter((r) => repoIds.includes(r.id));
-  const delegate = accounts.find((a) => a.id === delegateId);
+  const account = accounts.find((a) => a.id === accountId);
+  const workspaceAccount = accounts.find((a) => a.id === workspace.defaultAccountId) ?? accounts[0];
 
   const submit = async (thenDelegate: boolean) => {
     if (!title.trim() || busy) return;
     setBusy(true);
     try {
-      const issue = await api.createIssue(workspace.id, { title, description, status, priority, repoIds, delegateAccountId: delegateId });
+      const issue = await api.createIssue(workspace.id, { title, description, status, priority, repoIds, delegateAccountId: accountId });
       useStore.getState().set({ modal: thenDelegate ? { kind: 'delegate', issueId: issue.id, mode: 'headless' } : null, openIssueId: thenDelegate ? issue.id : null });
       toast(`${issue.identifier} criada.`, 'success');
     } finally {
@@ -75,10 +127,13 @@ function NewIssueModal({ status: initialStatus, repoIds: initialRepos, onClose }
       width={680}
       title={<><span className="ws-mark is-small">{workspace.key.slice(0, 2)}</span> Nova issue</>}
       onClose={onClose}
+      dirty={Boolean(title.trim() || description.trim())}
       footer={
         <>
-          <span className="dim foot-hint"><Kbd>Ctrl</Kbd> <Kbd>Enter</Kbd> para criar</span>
-          <button className="ghost-btn" onClick={() => submit(true)} disabled={!title.trim() || busy}><Bot size={14} /> Criar e delegar</button>
+          <span className="dim foot-hint"><Kbd>{modKey()}</Kbd> <Kbd>Enter</Kbd> para criar</span>
+          <button className="ghost-btn" onClick={() => submit(true)} disabled={!title.trim() || busy}>
+            <Bot size={14} /> {account ? `Criar e delegar a ${account.name}` : 'Criar e delegar'}
+          </button>
           <button className="primary-btn" onClick={() => submit(false)} disabled={!title.trim() || busy}>Criar issue</button>
         </>
       }
@@ -92,11 +147,12 @@ function NewIssueModal({ status: initialStatus, repoIds: initialRepos, onClose }
           }
         }}
       >
-        <input autoFocus className="title-input" placeholder="Título da issue" value={title} onChange={(e) => setTitle(e.target.value)} />
+        <input autoFocus className="title-input" placeholder="Título da issue" aria-label="Título da issue" value={title} onChange={(e) => setTitle(e.target.value)} />
         <AutoTextarea
           className="desc-input"
           minRows={5}
           placeholder="Descreva o que precisa ser feito… (vira o prompt do Claude)"
+          aria-label="Descrição"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
         />
@@ -125,18 +181,25 @@ function NewIssueModal({ status: initialStatus, repoIds: initialRepos, onClose }
               onSelect: () => setRepoIds((ids) => (ids.includes(r.id) ? ids.filter((id) => id !== r.id) : [...ids, r.id])),
             }))}
           />
-          <Menu
-            className="prop-btn"
-            trigger={<><AccountAvatar account={delegate} size={16} /> {delegate?.name ?? 'Delegado'}</>}
-            items={[
-              { key: 'none', label: 'Ninguém', selected: !delegate, onSelect: () => setDelegateId(null) },
-              ...accounts.map((a) => ({ key: a.id, label: a.name, icon: <AccountAvatar account={a} size={16} />, selected: a.id === delegateId, onSelect: () => setDelegateId(a.id) })),
-            ]}
-          />
+          {/* Só escolhe a conta usada ao delegar; quem inicia o trabalho é "Criar e delegar". */}
+          <span className="has-tooltip" title="A conta do Claude que vai trabalhar nesta issue quando você delegar. Escolher aqui não inicia nada: para o Claude começar, use “Criar e delegar”.">
+            <Menu
+              className="prop-btn"
+              width={300}
+              trigger={<><AccountAvatar account={account} size={16} /> {account ? account.name : 'Conta'}</>}
+              items={[
+                { key: 'default', label: 'Padrão do workspace', hint: workspaceAccount?.name ?? '', selected: !account, onSelect: () => setAccountId(null) },
+                ...accounts.map((a) => ({
+                  key: a.id, label: a.name, hint: loginHint(accountStatus[a.id]), icon: <AccountAvatar account={a} size={16} />,
+                  selected: a.id === accountId, onSelect: () => setAccountId(a.id),
+                })),
+              ]}
+            />
+          </span>
         </div>
         {selected.length > 0 && (
           <div className="cwd-hint">
-            O agente vai rodar em <code>{relativeTo(workspace.rootPath, commonFolder(workspace, selected))}</code>
+            O agente vai rodar em <code>{folderLabel(workspace, commonFolder(workspace, selected))}</code>
             {selected.length > 1 ? `, com o contexto de ${selected.length} repositórios.` : '.'}
           </div>
         )}
@@ -170,12 +233,16 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
   const [settings, setSettings] = useState(() => workspaceSettings(workspace));
   const [instructions, setInstructions] = useState('');
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
 
   if (!workspace || !issue) return null;
   const account = accounts.find((a) => a.id === accountId);
   const status = account ? accountStatus[account.id] : undefined;
   const selected = repos.filter((r) => issue.repoIds.includes(r.id));
   const cwd = commonFolder(workspace, selected);
+  // Sem login confirmado pelo `claude auth status`. Se a verificação falhou, não dá para afirmar nada.
+  const needsLogin = Boolean(account && status && !status.loggedIn && !status.error);
+  const headlessWithoutLogin = needsLogin && mode === 'headless';
 
   const go = async () => {
     setBusy(true);
@@ -188,16 +255,35 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
     }
   };
 
+  const verify = async () => {
+    if (!account) return;
+    setChecking(true);
+    try {
+      const next = await api.refreshAccount(account.id);
+      if (!next.loggedIn) toast(next.error ? `Não foi possível verificar: ${next.error}` : 'Ainda sem login nesta conta.');
+    } catch {
+      /* o aviso de erro já apareceu */
+    } finally {
+      setChecking(false);
+    }
+  };
+
   return (
     <Modal
       width={600}
       title={<>Delegar <span className="ident">{issue.identifier}</span></>}
       onClose={onClose}
+      dirty={Boolean(instructions.trim())}
       footer={
         <>
-          {status && !status.loggedIn && <span className="foot-hint is-error">Esta conta não está logada.</span>}
-          <button className="primary-btn" onClick={go} disabled={busy || !accountId}>
-            {mode === 'terminal' ? <><SquareTerminal size={14} /> Abrir no terminal</> : <><Bot size={14} /> Delegar</>}
+          {account && !status && <span className="foot-hint dim">Verificando o login da conta…</span>}
+          {status?.error && !status.loggedIn && (
+            <span className="foot-hint is-warn" title={status.error}>Não foi possível verificar o login desta conta.</span>
+          )}
+          <button className={headlessWithoutLogin ? 'ghost-btn' : 'primary-btn'} onClick={go} disabled={busy || !accountId}>
+            {mode === 'terminal'
+              ? <><SquareTerminal size={14} /> Abrir no terminal</>
+              : <><Bot size={14} /> {headlessWithoutLogin ? 'Delegar mesmo assim' : 'Delegar'}</>}
           </button>
         </>
       }
@@ -217,7 +303,7 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
         </div>
 
         <div className="cwd-hint">
-          Pasta: <code>{relativeTo(workspace.rootPath, cwd)}</code>
+          Pasta: <code>{folderLabel(workspace, cwd)}</code>
           {selected.length > 1 ? ` · contexto de ${selected.map((r) => r.name.split('/').at(-1)).join(' + ')}` : ''}
         </div>
 
@@ -226,7 +312,7 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
             className="prop-btn"
             trigger={<><AccountAvatar account={account} status={status} size={16} /> {account?.name ?? 'Escolher'}</>}
             items={accounts.map((a) => ({
-              key: a.id, label: a.name, hint: accountStatus[a.id]?.email ?? 'sem login', icon: <AccountAvatar account={a} size={16} />,
+              key: a.id, label: a.name, hint: loginHint(accountStatus[a.id]), icon: <AccountAvatar account={a} size={16} />,
               selected: a.id === accountId,
               onSelect: () => {
                 setAccountId(a.id);
@@ -235,6 +321,24 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
             }))}
           />
         </Field>
+
+        {needsLogin && account && (
+          <div className="login-needed" role="status">
+            <LogIn size={15} />
+            <div>
+              <strong>{account.name} ainda não fez login no Claude Code.</strong>
+              <span>
+                {mode === 'headless'
+                  ? 'Em segundo plano, a sessão para logo no começo sem o login.'
+                  : 'No terminal, o próprio Claude pede o login ao abrir.'}
+              </span>
+              <div className="login-needed-actions">
+                <button className="primary-btn is-small" onClick={() => void startLogin(account).catch(() => undefined)}>Fazer login</button>
+                <button className="ghost-btn is-small" onClick={() => void verify()} disabled={checking}>{checking ? 'Verificando…' : 'Já fiz, verificar'}</button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {accountId && (
           <SessionSettingsForm
@@ -256,50 +360,96 @@ function DelegateModal({ issueId, mode: initialMode, onClose }: { issueId: strin
 
 // ---------------------------------------------------------------- conectar pasta
 
+const samePath = (a: string, b: string) =>
+  a.trim().replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase() === b.trim().replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase();
+
+/**
+ * Raiz do disco, uma pasta logo abaixo dela (C:\Users, /home) ou a pasta pessoal: varrer isso
+ * leva tempo (passa por AppData, Library…) e raramente é o que se quer. Só a pedido.
+ */
+function isBroadPath(input: string, home: string | undefined): boolean {
+  const raw = input.trim();
+  if (!raw) return false;
+  if (/^[\\/]+$/.test(raw)) return true;
+  if (home && samePath(raw, home)) return true;
+  const parts = raw.split(/[\\/]/).filter(Boolean);
+  return parts.length <= (/^[a-z]:$/i.test(parts[0] ?? '') ? 2 : 1);
+}
+
+const DEPTHS = [1, 2, 3, 4, 5, 6];
+
 export function WorkspaceConnect({ onDone }: { onDone?: () => void }) {
   const meta = useStore((s) => s.meta);
-  const [rootPath, setRootPath] = useState(meta?.suggestedRoot ?? '');
+  const workspaces = useStore((s) => s.workspaces);
+  const home = meta?.home;
+  const sep = home?.includes('\\') ? '\\' : '/';
+  // Quando o Octo não acha uma pasta de projetos, a sugestão cai na pasta pessoal: aí é melhor não
+  // sugerir nada. Também não sugere uma pasta que já está conectada.
+  const [rootPath, setRootPath] = useState(() => {
+    const suggested = meta?.suggestedRoot ?? '';
+    const taken = useStore.getState().workspaces.some((w) => samePath(w.rootPath, suggested));
+    return !suggested || taken || (home && samePath(suggested, home)) ? '' : suggested;
+  });
   const [depth, setDepth] = useState(3);
   const [inspection, setInspection] = useState<FolderInspection | null>(null);
+  const [inspectError, setInspectError] = useState<string | null>(null);
   const [inspecting, setInspecting] = useState(false);
+  /** Caminho amplo que você pediu para varrer mesmo assim. */
+  const [forced, setForced] = useState('');
   const [name, setName] = useState('');
   const [key, setKey] = useState('');
+  /** Nome e prefixo digitados por você não são trocados pela sugestão da pasta. */
+  const edited = useRef({ name: false, key: false });
   const [busy, setBusy] = useState(false);
   const [picking, setPicking] = useState(false);
 
+  const path = rootPath.trim();
+  const broad = isBroadPath(path, home);
+  const waiting = broad && forced !== path;
+  const existing = path ? workspaces.find((w) => samePath(w.rootPath, path)) : undefined;
+
+  const openExisting = (workspace: Workspace) => {
+    useStore.getState().selectWorkspace(workspace.id);
+    useStore.getState().set({ view: 'issues' });
+    onDone?.();
+  };
+
+  const connected = Boolean(existing);
   useEffect(() => {
-    if (!rootPath.trim()) return setInspection(null);
+    setInspection(null);
+    setInspectError(null);
+    if (!path || waiting || connected) return setInspecting(false);
     setInspecting(true);
-    let current = true;
-    // fetch direto (e não api.*) para não exibir um toast de erro a cada tecla digitada.
+    const controller = new AbortController();
+    // Espera uma pausa na digitação e cancela a busca anterior quando o caminho muda.
     const timer = setTimeout(() => {
-      fetch('/api/fs/inspect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rootPath, scanDepth: depth }) })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data: FolderInspection | null) => {
-          if (!current) return;
+      api.inspectFolder(path, depth, controller.signal)
+        .then((data) => {
           setInspection(data);
-          if (data) {
-            setName((n) => n || data.name);
-            setKey((k) => k || data.name.normalize('NFD').replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase());
-          }
+          if (!edited.current.name) setName(data.name);
+          if (!edited.current.key) setKey(data.name.normalize('NFD').replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase());
         })
-        .catch(() => current && setInspection(null))
-        .finally(() => current && setInspecting(false));
-    }, 350);
+        .catch((error: Error) => {
+          if (error.name !== 'AbortError') setInspectError(error.message);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setInspecting(false);
+        });
+    }, 500);
     return () => {
-      current = false;
       clearTimeout(timer);
+      controller.abort();
     };
-  }, [rootPath, depth]);
+  }, [path, depth, waiting, connected]);
 
   const pick = async () => {
     setPicking(true);
     try {
-      const { path } = await api.pickFolder();
-      if (path) {
-        setName('');
-        setKey('');
-        setRootPath(path);
+      const { path: chosen } = await api.pickFolder();
+      if (chosen) {
+        edited.current = { name: false, key: false };
+        setForced(chosen.trim()); // escolhida no diálogo: é a pasta que você quer, mesmo se for ampla
+        setRootPath(chosen);
       }
     } finally {
       setPicking(false);
@@ -312,48 +462,98 @@ export function WorkspaceConnect({ onDone }: { onDone?: () => void }) {
       const workspace = await api.createWorkspace({ rootPath, name, key, scanDepth: depth });
       useStore.getState().selectWorkspace(workspace.id);
       useStore.getState().set({ view: 'issues' });
-      toast(`Workspace "${workspace.name}" conectado.`, 'success');
+      toast(`Pasta "${workspace.name}" conectada.`, 'success');
       onDone?.();
     } finally {
       setBusy(false);
     }
   };
 
+  const levels = `${depth} ${depth === 1 ? 'nível' : 'níveis'}`;
+  const found = inspection?.repos.length ?? 0;
+  const prefix = key || 'OCT';
+
   return (
     <div className="connect">
-      <Field label="Pasta raiz" hint="A pasta que contém seus repositórios — a mesma em que você abriria o cmd para rodar o claude.">
+      <Field label="Pasta raiz" hint="A pasta que contém seus repositórios: a mesma em que você abriria o terminal para rodar o claude.">
         <div className="input-row">
-          <input className="input mono" value={rootPath} onChange={(e) => setRootPath(e.target.value)} placeholder="C:\Users\voce\projetos" />
+          <input
+            className="input mono"
+            value={rootPath}
+            onChange={(e) => setRootPath(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && path && setForced(path)}
+            placeholder={home ? `${home}${sep}projetos` : 'Caminho da pasta'}
+            aria-label="Pasta raiz"
+          />
           <button className="ghost-btn" onClick={pick} disabled={picking}><FolderSearch size={14} /> {picking ? 'Aguardando…' : 'Escolher…'}</button>
         </div>
       </Field>
 
-      <div className="connect-preview">
-        {inspection ? (
+      <div className="connect-preview" aria-live="polite">
+        {existing ? (
+          <div className="connect-broad">
+            <span>Esta pasta já está conectada como “{existing.name}”.</span>
+            <button className="ghost-btn is-small" onClick={() => openExisting(existing)}>Abrir “{existing.name}”</button>
+          </div>
+        ) : inspection ? (
           <>
-            <div className="connect-count"><strong>{inspection.repos.length}</strong> repositórios git encontrados</div>
-            <div className="connect-repos">
-              {inspection.repos.slice(0, 40).map((r) => (
-                <span key={r} className="repo-chip"><i style={{ background: hue(r) }} />{r === '.' ? '(a própria pasta)' : r}</span>
-              ))}
-              {inspection.repos.length > 40 && <span className="dim">+{inspection.repos.length - 40}</span>}
-            </div>
+            <div className="connect-count"><strong>{found}</strong> {found === 1 ? 'repositório git encontrado' : 'repositórios git encontrados'}</div>
+            {found === 0 ? (
+              <p className="connect-empty">
+                Nenhum repositório git até {levels} abaixo desta pasta. Escolha a pasta que contém seus projetos ou aumente a profundidade.
+              </p>
+            ) : (
+              <div className="connect-repos">
+                {inspection.repos.slice(0, 40).map((r) => (
+                  <span key={r} className="repo-chip"><i style={{ background: hue(r) }} />{r === '.' ? '(a própria pasta)' : r}</span>
+                ))}
+                {inspection.repos.length > 40 && <span className="dim">+{inspection.repos.length - 40}</span>}
+              </div>
+            )}
+            {inspection.partial && (
+              <p className="connect-empty">
+                A busca parou no limite de pastas, então a lista pode estar incompleta. Escolha uma pasta mais específica ou diminua a profundidade.
+              </p>
+            )}
           </>
+        ) : !path ? (
+          <span className="dim">Escolha uma pasta para ver os repositórios.</span>
+        ) : waiting ? (
+          <div className="connect-broad">
+            <span>
+              {home && samePath(path, home) ? 'Esta é a sua pasta pessoal' : 'Esta pasta é muito ampla'}: procurar repositórios nela pode demorar.
+              Escolha a pasta onde ficam seus projetos ou procure assim mesmo.
+            </span>
+            <button className="ghost-btn is-small" onClick={() => setForced(path)}>Procurar assim mesmo</button>
+          </div>
+        ) : inspecting ? (
+          <span className="dim">Procurando repositórios…</span>
         ) : (
-          <span className="dim">
-            {!rootPath.trim() ? 'Escolha uma pasta para ver os repositórios.' : inspecting ? 'Procurando repositórios…' : 'Pasta não encontrada.'}
-          </span>
+          <span className="dim">{inspectError ?? 'Pasta não encontrada.'}</span>
         )}
       </div>
 
       <div className="settings-row">
-        <Field label="Nome"><input className="input" value={name} onChange={(e) => setName(e.target.value)} /></Field>
-        <Field label="Prefixo"><input className="input mono" value={key} maxLength={6} onChange={(e) => setKey(e.target.value.toUpperCase())} /></Field>
-        <Field label="Profundidade"><input className="input" type="number" min={1} max={6} value={depth} onChange={(e) => setDepth(Number(e.target.value) || 3)} /></Field>
+        <Field label="Nome" hint="Como a pasta aparece no Octo.">
+          <input className="input" value={name} onChange={(e) => { setName(e.target.value); edited.current.name = true; }} />
+        </Field>
+        <Field label="Prefixo" hint={`Vira o ID das issues: ${prefix}-1, ${prefix}-2…`}>
+          <input
+            className="input mono"
+            value={key}
+            maxLength={6}
+            onChange={(e) => { setKey(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '')); edited.current.key = true; }}
+          />
+        </Field>
+        <Field label="Profundidade" hint="Quantos níveis de subpastas procurar (3 = pasta › grupo › repositório).">
+          <select className="input" value={depth} onChange={(e) => setDepth(Number(e.target.value))}>
+            {DEPTHS.map((n) => <option key={n} value={n}>{n} {n === 1 ? 'nível' : 'níveis'}</option>)}
+          </select>
+        </Field>
       </div>
       <div className="connect-actions">
-        <button className="primary-btn" onClick={connect} disabled={busy || inspecting || !inspection}>
-          {busy ? 'Escaneando…' : 'Conectar workspace'}
+        <button className="primary-btn" onClick={connect} disabled={busy || inspecting || !inspection || Boolean(existing)}>
+          {busy ? 'Escaneando…' : found === 0 && inspection ? 'Conectar mesmo assim' : 'Conectar pasta'}
         </button>
       </div>
     </div>
@@ -375,11 +575,12 @@ function AccountModal({ onClose }: { onClose: () => void }) {
     setBusy(true);
     try {
       const account = await api.createAccount({ name, configDir, inherit });
-      if (login) await api.login(account.id);
-      toast(login ? 'Conclua o login no terminal que abriu.' : `Conta "${account.name}" adicionada.`, 'success');
+      // A conta já existe: o modal fecha mesmo que o terminal do login não abra (dá para tentar em Contas).
       onClose();
-    } finally {
-      setBusy(false);
+      if (login) await startLogin(account).catch(() => undefined);
+      else toast(`Conta "${account.name}" adicionada.`, 'success');
+    } catch {
+      setBusy(false); // o aviso de erro já apareceu (api.ts)
     }
   };
 
@@ -387,6 +588,7 @@ function AccountModal({ onClose }: { onClose: () => void }) {
     <Modal
       title="Adicionar conta do Claude"
       onClose={onClose}
+      dirty={Boolean(name.trim() || configDir.trim())}
       footer={
         <>
           <button className="ghost-btn" onClick={() => create(false)} disabled={!name.trim() || busy}>Só adicionar</button>
@@ -471,7 +673,7 @@ function PreferencesModal({ onClose }: { onClose: () => void }) {
 
 function ChangesModal({ dir, title, onClose }: { dir: string; title: string; onClose: () => void }) {
   const workspace = useWorkspace();
-  const fetcher = useCallback(() => api.folderChanges(workspace?.id ?? '', dir), [workspace?.id, dir]);
+  const fetcher = useCallback(() => api.folderChanges(workspace?.id ?? '', dir, true), [workspace?.id, dir]);
   if (!workspace) return null;
   return (
     <Modal width={900} title={<><FileDiff size={15} /> Mudanças · {title}</>} onClose={onClose}>
@@ -484,11 +686,24 @@ function ChangesModal({ dir, title, onClose }: { dir: string; title: string; onC
 
 function ContextModal({ dir, onClose }: { dir?: string; onClose: () => void }) {
   const workspace = useWorkspace();
+  const workspaceId = workspace?.id;
   const [info, setInfo] = useState<ContextInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
+
+  // Depende só do id: o workspace muda a cada issue criada, e a prévia não precisa ser refeita por isso.
   useEffect(() => {
-    if (workspace) void api.context(workspace.id, dir).then(setInfo);
-  }, [workspace, dir]);
+    if (!workspaceId) return;
+    let alive = true;
+    setError(null);
+    api.context(workspaceId, dir, true)
+      .then((next) => alive && setInfo(next))
+      .catch((e: Error) => alive && setError(e.message));
+    return () => {
+      alive = false;
+    };
+  }, [workspaceId, dir, attempt]);
   const where = useMemo(() => (workspace && dir ? relativeTo(workspace.rootPath, dir) : 'raiz'), [workspace, dir]);
   if (!workspace) return null;
 
@@ -518,10 +733,17 @@ function ContextModal({ dir, onClose }: { dir?: string; onClose: () => void }) {
       }
     >
       <p className="block-sub">
-        Com este arquivo na pasta, qualquer <code>claude</code> aberto ali (inclusive pelo seu “cmd → claude” de sempre) já sabe quais
+        Com este arquivo na pasta, qualquer <code>claude</code> aberto ali (inclusive o que você abre no terminal, como sempre) já sabe quais
         repositórios existem, onde ficam e como rodar cada um.
       </p>
-      <pre className="context-preview">{info?.preview ?? 'Gerando…'}</pre>
+      {error && !info ? (
+        <div className="inline-error">
+          Não foi possível gerar a prévia: {error}{' '}
+          <button className="link-btn" onClick={() => setAttempt((n) => n + 1)}>Tentar de novo</button>
+        </div>
+      ) : (
+        <pre className="context-preview">{info?.preview ?? 'Gerando…'}</pre>
+      )}
     </Modal>
   );
 }

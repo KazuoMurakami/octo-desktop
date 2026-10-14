@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { homedir } from 'node:os';
@@ -12,7 +12,7 @@ import {
   type Repo, type SessionSettings, type Workspace,
 } from '../shared/types.ts';
 import {
-  dismissDenials, isInside, isRunning, resumeInTerminal, sendMessage, sessionActivities, startHeadless, startInTerminal, stopSession,
+  dismissDenials, finishSession, isInside, isRunning, resumeInTerminal, sendMessage, sessionActivities, startHeadless, startInTerminal, stopSession,
   syncFromTranscript,
 } from './agent.ts';
 import { checkAccountStatus, claude } from './claude.ts';
@@ -20,17 +20,18 @@ import {
   addMcpServer, availablePlugins, copyItem, createItem, deleteItem, patchSettings, pluginAction, readAccountConfig, readItem, removeMcpServer,
   saveItem, writeSettingsRaw,
 } from './claudeConfig.ts';
-import { changesFor } from './changes.ts';
+import { changesFor, markPreexisting } from './changes.ts';
 import { readContextStatus, renderContextBlock, writeContext } from './context.ts';
 import { broadcast, subscribe } from './events.ts';
 import {
-  HttpError, addHistory, commitIssue, getAccount, getIssue, getSession, getWorkspace, now, workspaceRepos,
+  HttpError, addHistory, commitIssue, getAccount, getIssue, getSession, getWorkspace, now, requireFolder, workspaceRepos,
 } from './model.ts';
 import { apiToken, releaseLock, sameToken, writeLock } from './instance.ts';
 import { integrations, isKnownEditor, isKnownTerminal, openInEditor } from './integrations.ts';
 import { findRepoDirs, scanWorkspace } from './scanner.ts';
 import { checkUpdate } from './update.ts';
-import { DATA_DIR, db, flush, save } from './store.ts';
+import { DATA_DIR, db, dbNotice, flush, readBaseline, save } from './store.ts';
+import { copyTree, samePath } from './system.ts';
 import { openClaudeTerminal, openShell, pickFolder, revealFolder } from './terminal.ts';
 
 // server/ no código-fonte, dist-electron/ no app empacotado: a raiz é sempre um nível acima.
@@ -52,7 +53,8 @@ export interface ServerOptions {
   anyPortIfBusy?: boolean;
   /** Aceita a interface servida pelo Vite em localhost:5173 (só em desenvolvimento). */
   devOrigin?: boolean;
-  suggestedRoot?: string;
+  /** Pasta sugerida no onboarding; null = nenhuma sugestão. */
+  suggestedRoot?: string | null;
   /** Seletor de pasta nativo; o app desktop usa o diálogo do Electron. */
   pickFolder?: () => Promise<string | null>;
 }
@@ -61,7 +63,7 @@ const TOKEN = apiToken();
 /** Porta em que o servidor está escutando; dá nome ao cookie (cookies não separam portas). */
 let listeningPort = 0;
 let pick = pickFolder;
-let suggestedRoot = path.dirname(ROOT);
+let suggestedRoot: string | null = path.dirname(ROOT);
 
 const accountStatus: Record<string, AccountStatus> = {};
 
@@ -79,7 +81,12 @@ async function refreshStatus(account: ClaudeAccount): Promise<AccountStatus> {
   return status;
 }
 
-for (const account of db.accounts) void refreshStatus(account);
+/** Em segundo plano: uma falha aqui não pode virar uma rejeição sem tratamento (que encerra o processo). */
+function refreshStatusLater(account: ClaudeAccount): void {
+  refreshStatus(account).catch((error: unknown) => console.error('[octo] falha ao verificar a conta', error));
+}
+
+for (const account of db.accounts) refreshStatusLater(account);
 
 // ---------------------------------------------------------------- helpers
 
@@ -126,13 +133,45 @@ function fallbackModels(value: unknown): string | null {
   return models.length ? models.join(',') : null;
 }
 
+/**
+ * Caminho digitado ou colado: aceita ~ (pasta do usuário), %VARIÁVEL% no Windows e as aspas do
+ * "Copiar como caminho" do Explorer. Caminho relativo não é aceito: dependeria da pasta em que o
+ * Octo foi aberto.
+ */
+function userPath(value: unknown): string {
+  let text = str(value).trim();
+  if (/^(["']).*\1$/.test(text) && text.length >= 2) text = text.slice(1, -1).trim();
+  if (text === '~' || /^~[\\/]/.test(text)) text = path.join(homedir(), text.slice(1));
+  if (process.platform === 'win32') text = text.replace(/%([^%\\/]+)%/g, (whole, name: string) => process.env[name] ?? whole);
+  if (!text) throw new HttpError(400, 'Informe a pasta.');
+  if (!path.isAbsolute(text)) {
+    const example = process.platform === 'win32' ? 'C:\\Users\\voce\\projetos' : '~/projetos';
+    throw new HttpError(400, `Use o caminho completo da pasta (ex.: ${example}).`);
+  }
+  return path.resolve(text);
+}
+
 function existingDirs(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => str(item).trim()).filter(Boolean).map((dir) => {
-    const resolved = path.resolve(dir);
+    const resolved = userPath(dir);
     if (!existsSync(resolved) || !statSync(resolved).isDirectory()) throw new HttpError(400, `Pasta não encontrada: ${dir}`);
     return resolved;
   });
+}
+
+/**
+ * Regras de --allowedTools (ex.: "Bash(npm test)", "Edit", "mcp__servidor__ferramenta"). Nunca
+ * começam com "-": um valor assim encerraria a lista e viraria uma opção do claude.
+ */
+function allowedRules(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const rules = value.filter((rule): rule is string => typeof rule === 'string').map((rule) => rule.trim()).filter(Boolean);
+  if (rules.length > 50) throw new HttpError(400, 'Libere no máximo 50 ações de uma vez.');
+  for (const rule of rules) {
+    if (!/^[A-Za-z][\w.:-]*(\([\s\S]*\))?$/.test(rule)) throw new HttpError(400, `Regra de permissão inválida: ${rule.slice(0, 80)}`);
+  }
+  return rules;
 }
 
 function budget(value: unknown): number | null {
@@ -173,6 +212,8 @@ function projectDir(value: unknown): string | null {
 
 async function rescan(workspace: Workspace) {
   const repos = await scanWorkspace(workspace);
+  // Desconectado durante o escaneamento: não traz de volta o workspace nem os repositórios.
+  if (!db.workspaces.includes(workspace)) return [];
   db.repos = db.repos.filter((r) => r.workspaceId !== workspace.id).concat(repos);
   workspace.scannedAt = now();
   save();
@@ -261,6 +302,7 @@ app.get('/api/state', (_req, res) => {
       claudeProblem: resolved.problem,
       claudeWarning: resolved.warning,
       dataDir: DATA_DIR,
+      dbNotice: dbNotice(),
     },
   };
   res.json(state);
@@ -279,18 +321,26 @@ app.post('/api/fs/pick-folder', async (_req, res) => {
 });
 
 app.post('/api/fs/inspect', async (req, res) => {
-  const target = path.resolve(str(req.body.path).trim() || '.');
+  const target = userPath(req.body.path);
   if (!existsSync(target) || !statSync(target).isDirectory()) throw new HttpError(400, 'Pasta não encontrada.');
   const depth = Math.min(Math.max(Number(req.body.scanDepth) || 3, 1), 6);
-  const repos = await findRepoDirs(target, depth);
-  res.json({ path: target, name: path.basename(target), repos: repos.map((dir) => path.relative(target, dir).split(path.sep).join('/') || '.') });
+  // A interface pergunta de novo a cada pausa na digitação: a busca anterior para quando a pessoa desiste dela.
+  const abort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) abort.abort();
+  });
+  const { dirs, partial } = await findRepoDirs(target, depth, { maxDirs: 20_000, signal: abort.signal });
+  if (abort.signal.aborted) return;
+  res.json({ path: target, name: path.basename(target), repos: dirs.map((dir) => path.relative(target, dir).split(path.sep).join('/') || '.'), partial });
 });
 
 // ---------------------------------------------------------------- workspaces
 
 app.post('/api/workspaces', async (req, res) => {
-  const rootPath = path.resolve(str(req.body.rootPath).trim());
+  const rootPath = userPath(req.body.rootPath);
   if (!existsSync(rootPath) || !statSync(rootPath).isDirectory()) throw new HttpError(400, 'Pasta não encontrada.');
+  const existing = db.workspaces.find((w) => samePath(w.rootPath, rootPath));
+  if (existing) throw new HttpError(400, `Essa pasta já está conectada no workspace ${existing.name}.`);
   const name = str(req.body.name).trim() || path.basename(rootPath);
   const workspace: Workspace = {
     id: randomUUID(),
@@ -313,7 +363,7 @@ app.post('/api/workspaces', async (req, res) => {
   res.json(workspace);
 });
 
-app.patch('/api/workspaces/:id', (req, res) => {
+app.patch('/api/workspaces/:id', async (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const body = req.body as Record<string, unknown>;
   if (typeof body.name === 'string' && body.name.trim()) workspace.name = body.name.trim();
@@ -323,9 +373,16 @@ app.patch('/api/workspaces/:id', (req, res) => {
   if (asPermission(body.defaultPermissionMode)) workspace.defaultPermissionMode = asPermission(body.defaultPermissionMode)!;
   if (body.defaultModel !== undefined) workspace.defaultModel = cliValue(body.defaultModel, 'Modelo');
   if (body.defaultEffort !== undefined) workspace.defaultEffort = asEffort(body.defaultEffort);
-  if (body.scanDepth !== undefined) workspace.scanDepth = Math.min(Math.max(Number(body.scanDepth) || 3, 1), 6);
+  let depthChanged = false;
+  if (body.scanDepth !== undefined) {
+    const depth = Math.min(Math.max(Number(body.scanDepth) || 3, 1), 6);
+    depthChanged = depth !== workspace.scanDepth;
+    workspace.scanDepth = depth;
+  }
   save();
   broadcast({ type: 'workspace', workspace });
+  // Outra profundidade acha outros repositórios: reescaneia e só então responde (os repositórios já chegam atualizados).
+  if (depthChanged) await rescan(workspace);
   res.json(workspace);
 });
 
@@ -368,10 +425,10 @@ function folderIn(workspace: Workspace, value: unknown): string {
 }
 
 // Abre o Claude numa pasta do workspace — o "abrir a pasta, cmd, claude" de sempre, com a conta escolhida.
-app.post('/api/workspaces/:id/terminal', (req, res) => {
+app.post('/api/workspaces/:id/terminal', async (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const options = workspaceTerminalOptions(workspace, req.body);
-  res.json(startInTerminal({ ...options, issue: null, cwd: folderIn(workspace, req.body.dir) }));
+  res.json(await startInTerminal({ ...options, issue: null, cwd: folderIn(workspace, req.body.dir) }));
 });
 
 // ---------------------------------------------------------------- editores, terminal e mudanças
@@ -416,19 +473,19 @@ function editorFolders(dir: string, repos: Repo[]): string[] {
   return repos.length && repos.length <= 12 ? repos.map((r) => r.absPath) : [dir];
 }
 
-app.post('/api/workspaces/:id/open-editor', (req, res) => {
+app.post('/api/workspaces/:id/open-editor', async (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const dir = folderIn(workspace, req.body.dir);
   const ids = Array.isArray(req.body.repoIds) ? new Set(req.body.repoIds.filter((id: unknown) => typeof id === 'string')) : null;
   const repos = workspaceRepos(workspace.id).filter((r) => (ids ? ids.has(r.id) : isInside(dir, r.absPath)));
   const name = `${workspace.name}-${path.basename(dir)}`;
-  res.json({ editor: openInEditor({ editorId: str(req.body.editor) || null, name, dir, folders: editorFolders(dir, repos) }) });
+  res.json({ editor: await openInEditor({ editorId: str(req.body.editor) || null, name, dir, folders: editorFolders(dir, repos) }) });
 });
 
-app.post('/api/workspaces/:id/shell', (req, res) => {
+app.post('/api/workspaces/:id/shell', async (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const dir = folderIn(workspace, req.body.dir);
-  openShell(dir, `Octo · ${path.basename(dir)}`);
+  await openShell(dir, `Octo · ${path.basename(dir)}`);
   res.json({ ok: true });
 });
 
@@ -438,36 +495,67 @@ app.get('/api/workspaces/:id/changes', async (req, res) => {
   res.json(await changesFor(workspaceRepos(workspace.id).filter((r) => isInside(dir, r.absPath)).slice(0, 40)));
 });
 
-app.post('/api/sessions/:id/open-editor', (req, res) => {
+app.post('/api/sessions/:id/open-editor', async (req, res) => {
   const { session, focused, inScope } = sessionRepos(req.params.id);
   const repos = focused.length ? focused : inScope;
   const name = `${path.basename(session.cwd)}-${session.id.slice(0, 8)}`;
-  res.json({ editor: openInEditor({ editorId: str(req.body.editor) || null, name, dir: session.cwd, folders: editorFolders(session.cwd, repos) }) });
+  res.json({ editor: await openInEditor({ editorId: str(req.body.editor) || null, name, dir: session.cwd, folders: editorFolders(session.cwd, repos) }) });
 });
 
-app.post('/api/sessions/:id/shell', (req, res) => {
+app.post('/api/sessions/:id/shell', async (req, res) => {
   const session = getSession(req.params.id);
-  openShell(session.cwd, `Octo · ${path.basename(session.cwd)}`);
+  requireFolder(session.cwd, `A pasta desta sessão não existe mais: ${session.cwd}. Ela pode ter sido movida, renomeada ou apagada.`);
+  await openShell(session.cwd, `Octo · ${path.basename(session.cwd)}`);
   res.json({ ok: true });
 });
 
 app.get('/api/sessions/:id/changes', async (req, res) => {
-  const { focused, inScope } = sessionRepos(req.params.id);
-  res.json(await changesFor((focused.length ? focused : inScope).slice(0, 40)));
+  const { session, focused, inScope } = sessionRepos(req.params.id);
+  const changes = await changesFor((focused.length ? focused : inScope).slice(0, 40));
+  // Separa o que já estava alterado quando a sessão começou do que mudou durante ela.
+  const baseline = readBaseline(session.id);
+  if (baseline) markPreexisting(changes, baseline.repos, Date.parse(session.startedAt));
+  res.json(changes);
 });
 
-app.post('/api/workspaces/:id/reveal', (req, res) => {
-  revealFolder(folderIn(getWorkspace(req.params.id), req.body.dir));
+app.post('/api/workspaces/:id/reveal', async (req, res) => {
+  await revealFolder(folderIn(getWorkspace(req.params.id), req.body.dir));
   res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------- contas
 
+/** Variáveis do `env` do settings.json que levariam a chave ou o login da conta principal junto. */
+const CREDENTIAL_ENV = /^(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_BEARER_TOKEN_BEDROCK)$/;
+
+/**
+ * Copia o settings.json para a conta nova sem o que identifica quem paga: chaves no `env`,
+ * `apiKeyHelper` e os comandos de credencial da AWS. Com eles, a conta nova usaria a mesma chave
+ * da principal. Um settings.json que não é JSON válido fica de fora.
+ */
+function copySettingsWithoutCredentials(from: string, to: string): void {
+  let settings: unknown;
+  try {
+    settings = JSON.parse(readFileSync(from, 'utf8').replace(/^\uFEFF/, ''));
+  } catch {
+    return;
+  }
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return;
+  const data = settings as Record<string, unknown>;
+  for (const key of ['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport']) delete data[key];
+  if (data.env && typeof data.env === 'object' && !Array.isArray(data.env)) {
+    const env = data.env as Record<string, unknown>;
+    for (const key of Object.keys(env)) if (CREDENTIAL_ENV.test(key)) delete env[key];
+  }
+  writeFileSync(to, `${JSON.stringify(data, null, 2)}\n`);
+}
+
 app.post('/api/accounts', async (req, res) => {
   const name = str(req.body.name).trim();
   if (!name) throw new HttpError(400, 'Dê um nome para a conta.');
-  const configDir = path.resolve(str(req.body.configDir).trim() || path.join(homedir(), `.claude-${slug(name)}`));
-  if (db.accounts.some((a) => a.configDir && path.resolve(a.configDir) === configDir)) {
+  const configDir = str(req.body.configDir).trim() ? userPath(req.body.configDir) : path.join(homedir(), `.claude-${slug(name)}`);
+  const mainDir = path.join(homedir(), '.claude');
+  if (db.accounts.some((a) => samePath(a.configDir ?? mainDir, configDir))) {
     throw new HttpError(400, 'Já existe uma conta usando essa pasta de configuração.');
   }
   mkdirSync(configDir, { recursive: true });
@@ -476,7 +564,10 @@ app.post('/api/accounts', async (req, res) => {
     const source = path.join(homedir(), '.claude');
     for (const item of ['settings.json', 'CLAUDE.md', 'agents', 'commands', 'skills']) {
       const from = path.join(source, item);
-      if (existsSync(from) && !existsSync(path.join(configDir, item))) cpSync(from, path.join(configDir, item), { recursive: true });
+      const to = path.join(configDir, item);
+      if (!existsSync(from) || existsSync(to)) continue;
+      if (item === 'settings.json') copySettingsWithoutCredentials(from, to);
+      else copyTree(from, to);
     }
   }
   const account: ClaudeAccount = {
@@ -489,7 +580,7 @@ app.post('/api/accounts', async (req, res) => {
   db.accounts.push(account);
   save();
   broadcast({ type: 'account', account });
-  void refreshStatus(account);
+  refreshStatusLater(account);
   res.json(account);
 });
 
@@ -506,7 +597,13 @@ app.delete('/api/accounts/:id', (req, res) => {
   const account = getAccount(req.params.id);
   if (db.sessions.some((s) => s.accountId === account.id && isRunning(s.id))) throw new HttpError(400, 'Há sessões rodando com essa conta.');
   db.accounts = db.accounts.filter((a) => a.id !== account.id);
-  for (const workspace of db.workspaces) if (workspace.defaultAccountId === account.id) workspace.defaultAccountId = db.accounts[0]?.id ?? null;
+  // A interface recebe o workspace com a nova conta padrão: ela não adivinha qual é.
+  for (const workspace of db.workspaces) {
+    if (workspace.defaultAccountId === account.id) {
+      workspace.defaultAccountId = db.accounts[0]?.id ?? null;
+      broadcast({ type: 'workspace', workspace });
+    }
+  }
   for (const issue of db.issues) {
     if (issue.delegateAccountId === account.id) {
       issue.delegateAccountId = null;
@@ -523,9 +620,9 @@ app.post('/api/accounts/:id/status', async (req, res) => {
   res.json(await refreshStatus(getAccount(req.params.id)));
 });
 
-app.post('/api/accounts/:id/login', (req, res) => {
+app.post('/api/accounts/:id/login', async (req, res) => {
   const account = getAccount(req.params.id);
-  openClaudeTerminal({
+  await openClaudeTerminal({
     cwd: homedir(),
     account,
     args: ['auth', 'login'],
@@ -598,9 +695,11 @@ app.post('/api/accounts/:id/plugins', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/accounts/:id/reveal', (req, res) => {
+app.post('/api/accounts/:id/reveal', async (req, res) => {
   const account = getAccount(req.params.id);
-  revealFolder(account.configDir ?? path.join(homedir(), '.claude'));
+  const dir = account.configDir ?? path.join(homedir(), '.claude');
+  requireFolder(dir, `A pasta ${dir} ainda não existe. Ela é criada no primeiro login desta conta.`);
+  await revealFolder(dir);
   res.json({ ok: true });
 });
 
@@ -624,6 +723,7 @@ app.post('/api/workspaces/:id/issues', (req, res) => {
     priority: asPriority(req.body.priority) ?? 0,
     repoIds: Array.isArray(req.body.repoIds) ? req.body.repoIds.filter((id: string) => repoIds.has(id)) : [],
     delegateAccountId: req.body.delegateAccountId ? getAccount(str(req.body.delegateAccountId)).id : null,
+    reviewPending: false,
     sortOrder: -Date.now(),
     createdAt: now(),
     updatedAt: now(),
@@ -644,6 +744,7 @@ app.patch('/api/issues/:id', (req, res) => {
   const status = asStatus(body.status);
   if (status && status !== issue.status) {
     issue.status = status;
+    issue.reviewPending = false; // mudou à mão: a revisão adiada não passa por cima
     addHistory(issue, 'status', 'Você', `moveu para ${STATUS_LABEL[status]}`);
   }
   const priority = asPriority(body.priority);
@@ -660,7 +761,7 @@ app.patch('/api/issues/:id', (req, res) => {
     const account = body.delegateAccountId ? getAccount(str(body.delegateAccountId)) : null;
     if ((account?.id ?? null) !== issue.delegateAccountId) {
       issue.delegateAccountId = account?.id ?? null;
-      addHistory(issue, 'delegate', 'Você', account ? `delegou para ${account.name}` : 'removeu o delegado');
+      addHistory(issue, 'delegate', 'Você', account ? `definiu a conta como ${account.name}` : 'voltou para a conta padrão do workspace');
     }
   }
   if (typeof body.sortOrder === 'number') issue.sortOrder = body.sortOrder;
@@ -677,11 +778,11 @@ app.delete('/api/issues/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/issues/:id/delegate', (req, res) => {
+app.post('/api/issues/:id/delegate', async (req, res) => {
   const issue = getIssue(req.params.id);
   const workspace = getWorkspace(issue.workspaceId);
   const options = { ...workspaceTerminalOptions(workspace, req.body), issue };
-  res.json(req.body.mode === 'terminal' ? startInTerminal(options) : startHeadless(options));
+  res.json(req.body.mode === 'terminal' ? await startInTerminal(options) : startHeadless(options));
 });
 
 // ---------------------------------------------------------------- sessões
@@ -694,8 +795,7 @@ app.post('/api/sessions/:id/message', (req, res) => {
   const session = getSession(req.params.id);
   const text = str(req.body.text).trim();
   if (!text) throw new HttpError(400, 'Escreva uma mensagem.');
-  const allowed = Array.isArray(req.body.allowedTools) ? req.body.allowedTools.filter((t: unknown) => typeof t === 'string') : [];
-  sendMessage(session, text, allowed, settingsChanges(req.body));
+  sendMessage(session, text, allowedRules(req.body.allowedTools), settingsChanges(req.body));
   res.json(session);
 });
 
@@ -704,14 +804,20 @@ app.post('/api/sessions/:id/dismiss-denials', (req, res) => {
   res.json({ ok: true });
 });
 
+// "Concluir": sessão aberta no terminal (ou aguardando permissão) que a pessoa dá por encerrada.
+app.post('/api/sessions/:id/finish', (req, res) => {
+  finishSession(getSession(req.params.id));
+  res.json({ ok: true });
+});
+
 app.post('/api/sessions/:id/stop', (req, res) => {
   stopSession(getSession(req.params.id));
   res.json({ ok: true });
 });
 
-app.post('/api/sessions/:id/terminal', (req, res) => {
+app.post('/api/sessions/:id/terminal', async (req, res) => {
   const session = getSession(req.params.id);
-  resumeInTerminal(session);
+  await resumeInTerminal(session);
   res.json(session);
 });
 
@@ -723,9 +829,34 @@ app.post('/api/sessions/:id/sync', (req, res) => {
 
 // ---------------------------------------------------------------- estáticos e erros
 
+/**
+ * A interface só carrega o que vem do próprio Octo: uma resposta do agente com uma imagem
+ * remota (ex.: ![x](https://site/?dados=…)) não faz a janela buscar nada lá fora.
+ */
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "img-src 'self' data:",
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self' data:",
+  "script-src 'self'",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+].join('; ');
+
 if (existsSync(DIST)) {
-  app.use(express.static(DIST));
-  app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(path.join(DIST, 'index.html')));
+  app.use(
+    express.static(DIST, {
+      setHeaders: (res, file) => {
+        if (file.endsWith('.html')) res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+      },
+    }),
+  );
+  app.get(/^(?!\/api\/).*/, (_req, res) => {
+    res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+    res.sendFile(path.join(DIST, 'index.html'));
+  });
 }
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -748,7 +879,7 @@ function listen(port: number): Promise<Server> {
 
 export async function startServer(options: ServerOptions): Promise<{ url: string; server: Server }> {
   if (options.pickFolder) pick = options.pickFolder;
-  if (options.suggestedRoot) suggestedRoot = options.suggestedRoot;
+  if (options.suggestedRoot !== undefined) suggestedRoot = options.suggestedRoot;
   if (options.devOrigin) for (const host of ['127.0.0.1:5173', 'localhost:5173']) allowedHosts.add(host);
 
   const server = await listen(options.port).catch((error: NodeJS.ErrnoException) => {

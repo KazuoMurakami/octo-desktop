@@ -2,7 +2,11 @@
 # As releases do GitHub são montadas pelo workflow em .github/workflows/release.yml.
 # Os nomes dos arquivos não levam a versão: assim os links .../releases/latest/download/<arquivo>
 # do README sempre apontam para a versão mais nova.
-appId: dev.octo.app
+
+# Identificador definitivo: o Windows deriva dele a chave de desinstalação e o atalho, e o macOS
+# guarda nele as permissões dadas ao app. Trocar depois faz o instalador novo não reconhecer o
+# antigo. O mesmo valor está em app.setAppUserModelId (electron/main.ts).
+appId: io.github.kazuomurakami.octo
 productName: Octo
 copyright: Copyright © 2026 Octo contributors
 
@@ -14,6 +18,32 @@ files:
   - dist/**
   - dist-electron/**
   - package.json
+
+# Licença do Octo e avisos de licença das bibliotecas embutidas na interface (gerados por
+# scripts/build-desktop.mjs), visíveis também fora do app.asar, em resources/licenses.
+extraResources:
+  - from: dist/licenses
+    to: licenses
+
+# Fuses do Electron: chaves gravadas no próprio executável, que nenhuma variável de ambiente muda.
+# Os valores são conferidos no CI por scripts/check-fuses.mjs.
+electronFuses:
+  # Fica ligado: o terminal do Octo roda o launcher (server/launcher.mjs) com o próprio executável
+  # do app como Node (ELECTRON_RUN_AS_NODE), e o app desktop lê o ambiente do seu shell do mesmo
+  # jeito. Desligar exige trocar o launcher por um script do sistema antes.
+  runAsNode: true
+  # Fica ligado: com ele desligado, o Electron apaga o NODE_EXTRA_CA_CERTS do ambiente, e o Claude
+  # Code das sessões deixa de confiar no certificado do proxy da empresa. No app empacotado o
+  # Electron já ignora o NODE_OPTIONS (aceita só --max-http-header-size e --http-parser).
+  enableNodeOptionsEnvironmentVariable: true
+  # --inspect e o sinal SIGUSR1 não abrem um depurador no processo principal.
+  enableNodeCliInspectArguments: false
+  # O app só carrega o código de dentro do app.asar, e o conteúdo dele é conferido contra o hash
+  # gravado no executável (macOS e Windows): um app.asar alterado não abre.
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
+  # A interface vem de http://127.0.0.1; páginas file:// não precisam de privilégios extras.
+  grantFileProtocolExtraPrivileges: false
 
 win:
   target: nsis
@@ -32,6 +62,17 @@ mac:
   category: public.app-category.developer-tools
   icon: build/icon.png
   artifactName: Octo-mac-${arch}.${ext}
+  # Assinatura ad-hoc: sem certificado da Apple, mas com o selo de assinatura válido. Sem ela o
+  # macOS diz que o app "está danificado"; com ela, o aviso é o de desenvolvedor não verificado,
+  # liberado em Ajustes do Sistema (veja o README). Funciona com CSC_IDENTITY_AUTO_DISCOVERY=false.
+  identity: "-"
+  # As permissões padrão do electron-builder (JIT, memória executável e disable-library-validation,
+  # exigida pela assinatura ad-hoc com hardened runtime) mais a de Apple Events, usada para abrir
+  # o iTerm2.
+  entitlements: build/entitlements.mac.plist
+  extendInfo:
+    # Texto do pedido de permissão de Automação do macOS.
+    NSAppleEventsUsageDescription: O Octo controla o seu app de terminal (como o iTerm2) para abrir o Claude Code na pasta do projeto.
 
 linux:
   target:
@@ -44,5 +85,9 @@ linux:
   maintainer: Octo <99770253+KazuoMurakami@users.noreply.github.com>
   synopsis: Issues no estilo Linear para o Claude Code em vários repositórios
   artifactName: Octo-linux-x64.${ext}
+
+# AppImage: continua no runtime padrão (FUSE 2, estável). O runtime estático, que dispensa o
+# libfuse2 (toolsets.appimage "1.0.3"), ainda é beta no electron-builder 26 e vira o padrão no 27.
+# O README orienta instalar o libfuse2 ou usar o .deb, que é o recomendado no Ubuntu e no Debian.
 
 publish: null

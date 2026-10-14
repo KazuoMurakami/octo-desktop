@@ -4,17 +4,22 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Fixo: o ubuntu-latest passa para o 26.04 entre outubro e novembro de 2026.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -22,6 +27,11 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build:desktop
+      - name: Licenças que vão no instalador
+        run: |
+          test -s dist/licenses/THIRD_PARTY_NOTICES.md
+          test -s dist/licenses/LICENSE-Octo.txt
+          grep -c '^## ' dist/licenses/THIRD_PARTY_NOTICES.md
       - name: O servidor sobe e protege a API
         env:
           OCTO_DATA_DIR: ${{ runner.temp }}/octo-ci
@@ -31,5 +41,10 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:4400/api/health && break; sleep 1; done
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4400/api/state)" = 401
           curl -sf -H "x-octo-token: $(cat "$OCTO_DATA_DIR/token")" http://127.0.0.1:4400/api/state > /dev/null
-          curl -sf http://127.0.0.1:4400/ | grep -q '<div id="root">'
-          cat server.log
+          html=$(curl -sf -D headers.txt http://127.0.0.1:4400/)
+          grep -q '<div id="root">' <<< "$html"
+          # A página da interface sai com Content-Security-Policy.
+          grep -qi '^content-security-policy:.*frame-ancestors' headers.txt
+      - name: Log do servidor
+        if: always()
+        run: cat server.log || true

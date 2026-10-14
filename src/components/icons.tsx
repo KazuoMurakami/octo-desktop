@@ -89,14 +89,17 @@ export function AccountAvatar({ account, status, size = 18 }: { account?: Claude
     return <span className="avatar is-empty" style={{ width: size, height: size }} />;
   }
   const initials = account.name.slice(0, 1).toUpperCase();
+  // Sem login fica em amarelo; quando a verificação falhou (tempo esgotado etc.), em cinza: não dá para afirmar.
+  const login = !status ? null : status.loggedIn ? 'is-on' : status.error ? 'is-unknown' : 'is-off';
+  const detail = !status ? '' : status.loggedIn ? (status.email ?? 'conectada') : status.error ? 'não foi possível verificar o login' : 'sem login';
   return (
     <span
       className="avatar"
-      title={`${account.name}${status?.email ? ` · ${status.email}` : ''}`}
+      title={`${account.name}${detail ? ` · ${detail}` : ''}`}
       style={{ width: size, height: size, background: account.color, fontSize: size * 0.5 }}
     >
       {initials}
-      {status && <i className={`avatar-dot ${status.loggedIn ? 'is-on' : 'is-off'}`} />}
+      {login && <i className={`avatar-dot ${login}`} />}
     </span>
   );
 }

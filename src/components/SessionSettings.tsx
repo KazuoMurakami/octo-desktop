@@ -5,6 +5,8 @@ import {
   type Effort, type PermissionMode, type SessionSettings,
 } from '../../shared/types.ts';
 import { setting, useAccountConfig } from '../claudeConfig.ts';
+import { useStore } from '../store.ts';
+import { ConfirmDialog } from './modals.tsx';
 import { Field, Menu } from './ui.tsx';
 
 export function modelLabel(model: string | null): string {
@@ -103,19 +105,80 @@ export function EffortPicker({ value, onChange, accountDefault, compact = false 
   );
 }
 
-export function PermissionPicker({ value, onChange }: { value: PermissionMode; onChange: (mode: PermissionMode) => void }) {
+/** Modo de permissão. "Sem restrições" só vale depois de você confirmar que entendeu o risco. */
+export function PermissionPicker({ value, onChange }: { value: PermissionMode; onChange: (mode: PermissionMode) => unknown }) {
+  const [asking, setAsking] = useState(false);
   return (
-    <Menu
-      className="prop-btn"
-      width={360}
-      trigger={<><ShieldCheck size={13} /> {PERMISSION_LABEL[value]}</>}
-      items={PERMISSION_MODES.map((m) => ({
-        key: m,
-        label: <span className="two-line"><strong>{PERMISSION_LABEL[m]}</strong><small>{PERMISSION_HELP[m]}</small></span>,
-        selected: m === value,
-        danger: m === 'bypassPermissions',
-        onSelect: () => onChange(m),
-      }))}
+    <>
+      <Menu
+        className={`prop-btn${value === 'bypassPermissions' ? ' is-danger-value' : ''}`}
+        width={360}
+        trigger={<><ShieldCheck size={13} /> {PERMISSION_LABEL[value]}</>}
+        items={PERMISSION_MODES.map((m) => ({
+          key: m,
+          label: <span className="two-line"><strong>{PERMISSION_LABEL[m]}</strong><small>{PERMISSION_HELP[m]}</small></span>,
+          selected: m === value,
+          danger: m === 'bypassPermissions',
+          // Falha ao salvar já vira aviso em api.ts; aqui só evita a rejeição solta.
+          onSelect: () => (m === 'bypassPermissions' && value !== m ? setAsking(true) : void Promise.resolve(onChange(m)).catch(() => undefined)),
+        }))}
+      />
+      {asking && (
+        <ConfirmDialog
+          title="Liberar o Claude sem restrições?"
+          confirmLabel="Liberar mesmo assim"
+          onConfirm={() => onChange('bypassPermissions')}
+          onClose={() => setAsking(false)}
+        >
+          <p>
+            O Claude vai executar <strong>qualquer comando sem perguntar</strong>: apagar arquivos, instalar pacotes, rodar scripts e mexer
+            fora da pasta da sessão. Um engano dele vira um estrago na hora, sem chance de você barrar.
+          </p>
+          <p>Use só em pastas descartáveis, como uma cópia do projeto ou um contêiner. No dia a dia, “Aceitar edições” ou “Automático” costumam bastar.</p>
+        </ConfirmDialog>
+      )}
+    </>
+  );
+}
+
+/** Exemplo de caminho no formato do sistema (C:\… no Windows, /… no macOS e no Linux). */
+function examplePath(home: string | undefined, name: string): string {
+  if (!home) return name;
+  const sep = home.includes('\\') ? '\\' : '/';
+  return `${home.replace(/[\\/]+$/, '')}${sep}${name}`;
+}
+
+/** Valor em US$ digitado como texto: aceita "0,50" e "0.5"; vazio ou zero = sem limite. */
+function BudgetInput({ value, onChange }: { value: number | null; onChange: (value: number | null) => void }) {
+  const [draft, setDraft] = useState(value === null ? '' : String(value));
+  const parse = (text: string): number | null | undefined => {
+    const clean = text.trim().replace(',', '.');
+    if (!clean) return null;
+    const n = Number(clean);
+    return Number.isFinite(n) && n > 0 ? n : undefined; // "0", "0," e "abc" ainda não são um valor
+  };
+  return (
+    <input
+      className="input"
+      inputMode="decimal"
+      placeholder="sem limite"
+      aria-label="Orçamento máximo em US$"
+      value={draft}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        const next = parse(e.target.value);
+        if (next !== undefined) onChange(next);
+      }}
+      onBlur={() => {
+        const next = parse(draft);
+        // Zero ou texto inválido ao sair do campo: fica sem limite, e o campo mostra isso.
+        if (next === undefined) {
+          onChange(null);
+          setDraft('');
+        } else {
+          setDraft(next === null ? '' : String(next));
+        }
+      }}
     />
   );
 }
@@ -132,6 +195,7 @@ export function SessionSettingsForm({ settings, onChange, accountId, cwd, mode }
   mode: 'headless' | 'terminal';
 }) {
   const { config } = useAccountConfig(accountId, cwd);
+  const home = useStore((s) => s.meta?.home);
   const agents = config?.items.filter((i) => i.kind === 'agent') ?? [];
   // Abre 'Mais opções' já no início se algo ali estiver preenchido; depois, quem decide é você.
   const [advancedOpen] = useState(() => Boolean(settings.agent || settings.fallbackModel || settings.addDirs.length || settings.maxBudgetUsd));
@@ -181,7 +245,7 @@ export function SessionSettingsForm({ settings, onChange, accountId, cwd, mode }
           <textarea
             className="mono"
             rows={2}
-            placeholder={'C:\\outro\\repositorio'}
+            placeholder={examplePath(home, 'outro-repositorio')}
             value={settings.addDirs.join('\n')}
             onChange={(e) => onChange({ addDirs: e.target.value.split('\n') })}
             onBlur={() => onChange({ addDirs: settings.addDirs.map((d) => d.trim()).filter(Boolean) })}
@@ -189,15 +253,7 @@ export function SessionSettingsForm({ settings, onChange, accountId, cwd, mode }
         </Field>
         {mode === 'headless' && (
           <Field label="Orçamento máximo (US$)" hint="Interrompe a execução ao atingir o valor (--max-budget-usd).">
-            <input
-              className="input"
-              type="number"
-              min={0}
-              step={0.5}
-              placeholder="sem limite"
-              value={settings.maxBudgetUsd ?? ''}
-              onChange={(e) => onChange({ maxBudgetUsd: Number(e.target.value) > 0 ? Number(e.target.value) : null })}
-            />
+            <BudgetInput value={settings.maxBudgetUsd} onChange={(maxBudgetUsd) => onChange({ maxBudgetUsd })} />
           </Field>
         )}
       </details>

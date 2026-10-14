@@ -10,7 +10,8 @@
   --border-strong: #2f2f38;
   --text: #ececf1;
   --text-2: #a3a3ad;
-  --text-3: #6c6c78;
+  /* Texto secundário: no mínimo 4,5:1 (WCAG AA) sobre todos os fundos, inclusive --bg-hover. */
+  --text-3: #8a8a94;
   --agent: #d97757;
   --agent-soft: rgba(217, 119, 87, 0.13);
   --agent-line: rgba(217, 119, 87, 0.38);
@@ -71,6 +72,11 @@ code { font-size: 0.86em; background: var(--bg-3); border: 1px solid var(--borde
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 10px; border: 3px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+/* Linhas que ocupam a largura toda de um contêiner com rolagem: o contorno vai para dentro, senão é cortado. */
+.item-row:focus-visible, .change-row:focus-visible, .session-row:focus-visible, .tabs button:focus-visible, .side-repo:focus-visible,
+.side-group-head:focus-visible, .side-link:focus-visible, .act-action-row:focus-visible { outline-offset: -2px; }
+/* Contêineres que recebem foco por código (diálogos, listas de menu): o destaque fica nos itens. */
+.modal:focus, .palette:focus, .menu-list:focus { outline: none; }
 
 /* ---------------------------------------------------------------- botões */
 
@@ -135,7 +141,7 @@ code { font-size: 0.86em; background: var(--bg-3); border: 1px solid var(--borde
   border-radius: 6px;
   outline: none;
 }
-.input:focus, textarea:focus { border-color: var(--focus); }
+.input:focus, textarea:focus, .menu-filter:focus { border-color: var(--focus); }
 textarea {
   width: 100%;
   resize: none;
@@ -191,6 +197,10 @@ textarea {
   font-weight: 600;
 }
 .ws-switcher:hover { background: var(--bg-3); }
+.side-top { display: flex; align-items: center; gap: 4px; }
+.side-top .ws-switcher { flex: 1; min-width: 0; }
+/* Só aparece quando a sidebar vira gaveta (janelas estreitas). */
+.side-close { display: none; flex: none; }
 .ws-name { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-mark {
   display: inline-grid;
@@ -289,6 +299,7 @@ textarea {
 .launch strong { color: var(--text); font-size: 12.5px; }
 .launch small { color: var(--text-3); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .launch:hover { border-color: var(--agent); }
+.launch:disabled { opacity: 0.75; cursor: progress; }
 .launch-account { padding: 4px; border-radius: 6px; }
 .launch-account:hover { background: var(--bg-3); }
 
@@ -322,6 +333,7 @@ textarea {
   color: var(--text-3);
 }
 .search input { border: 0; outline: 0; background: none; width: 150px; }
+.search:focus-within { border-color: var(--focus); }
 .filter-chip { display: inline-flex; align-items: center; gap: 4px; color: var(--text-3); }
 .filter-chip:hover { color: var(--text); }
 
@@ -478,7 +490,8 @@ textarea {
 .avatar.is-empty { border: 1px dashed var(--border-strong); }
 .avatar-dot { position: absolute; right: -2px; bottom: -2px; width: 8px; height: 8px; border-radius: 50%; border: 2px solid var(--bg-1); }
 .avatar-dot.is-on { background: var(--ok); }
-.avatar-dot.is-off { background: var(--text-3); }
+.avatar-dot.is-off { background: var(--warn); }
+.avatar-dot.is-unknown { background: var(--text-3); }
 .status-icon { flex: none; }
 
 .orbit { color: var(--agent); flex: none; }
@@ -525,7 +538,6 @@ textarea {
 }
 @keyframes pop { from { opacity: 0; transform: translateY(-3px) scale(0.98); } }
 .menu-filter { height: 30px; margin-bottom: 4px; border-color: var(--border); }
-.menu-focus-sink { position: absolute; opacity: 0; width: 0; height: 0; border: 0; padding: 0; }
 .menu-list { max-height: 300px; overflow-y: auto; }
 .menu-item {
   display: flex;
@@ -620,6 +632,8 @@ textarea {
 }
 .palette-item span:first-of-type { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .palette-item.is-active { background: var(--bg-hover); color: var(--text); }
+.palette-foot { display: flex; gap: 16px; padding: 8px 14px; border-top: 1px solid var(--border); color: var(--text-3); font-size: 11.5px; }
+.palette-foot span { display: inline-flex; align-items: center; gap: 4px; }
 
 /* ---------------------------------------------------------------- formulários */
 
@@ -664,6 +678,7 @@ textarea {
   background: none;
   padding: 4px 0;
 }
+.title-input:focus-visible { box-shadow: inset 0 -2px 0 var(--focus); }
 .desc-input { border: 0; background: none; padding: 4px 0; color: var(--text-2); }
 .desc-input:focus { border: 0; }
 
@@ -786,22 +801,27 @@ textarea {
   overflow: hidden;
   min-height: 0;
 }
-.agent-head { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--bg-1); }
-.agent-head-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+/* Sem espaço para o texto ao lado dos botões, os botões descem para uma linha própria (o texto não some). */
+.agent-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--bg-1); }
+.agent-head-text { flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .agent-head-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
 .agent-head-row strong { font-size: 13px; }
 .agent-actions { display: flex; gap: 6px; }
 .agent-actions .ghost-btn { height: 26px; font-size: 12px; }
+/* Numa sessão muito estreita, em que nem rótulo e abas cabem lado a lado, as abas descem em vez de ficarem cortadas. */
 .repo-rail {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
-  overflow-x: auto;
   background: linear-gradient(90deg, var(--agent-soft), transparent 40%);
 }
 .rail-label { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--agent); text-transform: uppercase; letter-spacing: 0.06em; margin-right: 4px; flex: none; }
+/* Só os repositórios rolam; rótulo e abas ficam fixos nas pontas. O padding (compensado na margem) deixa o brilho dos repositórios
+   acesos à vista; à direita a margem fica, para o repositório cortado não encostar nas abas. */
+.repo-rail-chips { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; padding: 6px; margin: -6px 0 -6px -6px; }
 
 .feed { overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; max-height: 62vh; min-height: 120px; }
 .drawer-session .feed { max-height: none; flex: 1; }
@@ -887,6 +907,9 @@ textarea {
 .md table { border-collapse: collapse; font-size: 12.5px; margin: 6px 0 10px; }
 .md th, .md td { border: 1px solid var(--border-strong); padding: 4px 8px; }
 .md blockquote { margin: 0 0 8px; padding-left: 10px; border-left: 2px solid var(--border-strong); color: var(--text-2); }
+/* Imagens das respostas não carregam: aparecem como um link para abrir no navegador, se você quiser. */
+.md-image { display: inline-block; padding: 0 6px; border-radius: 4px; border: 1px dashed var(--border-strong); color: var(--text-2); font-size: 12px; text-decoration: none; }
+a.md-image:hover { color: var(--text); border-color: var(--focus); }
 
 /* ---------------------------------------------------------------- sessões */
 
@@ -928,15 +951,25 @@ textarea {
 .group-repos { display: flex; gap: 5px; flex-wrap: wrap; }
 .group-actions { display: flex; gap: 6px; margin-top: auto; }
 
-.repo-table { margin: 4px 20px 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+/* Em janelas médias a tabela esconde Stack e, depois, Último commit; abaixo disso rola de lado (nunca corta as ações). */
+.repo-table { margin: 4px 20px 0; border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; container-type: inline-size; }
 .repo-tr {
   display: grid;
   grid-template-columns: minmax(220px, 2.2fr) minmax(130px, 1fr) 90px minmax(160px, 1.6fr) 110px 128px;
   align-items: center;
   gap: 12px;
+  min-width: 926px;
   padding: 9px 14px;
   border-bottom: 1px solid var(--border);
   font-size: 12.5px;
+}
+@container (max-width: 925px) {
+  .repo-tr { grid-template-columns: minmax(180px, 2fr) minmax(120px, 1fr) 90px 110px 128px; min-width: 704px; }
+  .repo-tr > :nth-child(4) { display: none; }
+}
+@container (max-width: 703px) {
+  .repo-tr { grid-template-columns: minmax(160px, 2fr) minmax(110px, 1fr) 80px 128px; min-width: 542px; }
+  .repo-tr > :nth-child(5) { display: none; }
 }
 .repo-tr:last-child { border-bottom: 0; }
 .repo-tr:not(.is-head):hover { background: var(--bg-1); }
@@ -1004,10 +1037,23 @@ textarea {
 
 /* ---------------------------------------------------------------- toasts */
 
-.toasts { position: fixed; right: 16px; bottom: 16px; z-index: 80; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+.toasts {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+  max-width: calc(100vw - 32px);
+}
 .toast {
-  max-width: 420px;
-  padding: 10px 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 440px;
+  padding: 8px 8px 8px 14px;
   border-radius: 9px;
   background: var(--bg-2);
   border: 1px solid var(--border-strong);
@@ -1017,10 +1063,70 @@ textarea {
 }
 .toast.is-success { border-color: rgba(63, 182, 139, 0.4); }
 .toast.is-error { border-color: rgba(239, 107, 115, 0.5); color: #ffc2c6; }
+.toast-text { flex: 1; min-width: 0; padding: 2px 0; }
+.toast-action {
+  flex: none;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.toast-action:hover { background: var(--bg-3); }
+.toast-close { flex: none; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 6px; color: var(--text-3); }
+.toast-close:hover { background: var(--bg-3); color: var(--text); }
+
+/* ---------------------------------------------------------------- janelas estreitas: barra do topo e gaveta */
+
+.mobile-bar {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  flex: none;
+}
+.mobile-title { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-toggle { position: relative; flex: none; }
+.nav-badge {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--warn);
+  color: var(--bg);
+  font: 600 10px/16px var(--font);
+  font-style: normal;
+}
+.side-search.mobile-search { margin: 0; flex: none; }
+.side-search.mobile-search span { flex: none; }
+.nav-backdrop { position: fixed; inset: 0; z-index: 35; background: rgba(5, 5, 7, 0.45); animation: fade 0.15s ease; }
 
 @media (max-width: 900px) {
   .app { grid-template-columns: 1fr; }
-  .sidebar { display: none; }
+  /* A sidebar vira uma gaveta: fora da tela (e fora do Tab) até o botão da barra do topo abri-la. */
+  .sidebar {
+    position: fixed;
+    z-index: 36;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(300px, calc(100vw - 48px));
+    box-shadow: 30px 0 80px -30px rgba(0, 0, 0, 0.9);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition: transform 0.2s ease, visibility 0s linear 0.2s;
+  }
+  .app.is-nav-open .sidebar { transform: none; visibility: visible; transition: transform 0.2s ease; }
+  .side-close { display: inline-flex; }
+  .mobile-bar { display: flex; }
   .drawer { width: calc(100vw - 16px); min-width: 0; }
   .drawer-body { grid-template-columns: 1fr; }
   .drawer-side { border-left: 0; border-top: 1px solid var(--border); }
@@ -1222,3 +1328,82 @@ button.item-row:hover { background: var(--bg-hover); }
 .health-bar .claude-missing { margin-bottom: 0; }
 .claude-missing.is-compact { max-width: 860px; }
 .offline.is-warning { background: rgba(229, 184, 75, 0.1); color: var(--text-2); }
+
+/* ---------------------------------------------------------------- primeiros passos e login */
+
+.setup-steps { list-style: none; margin: 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 6px; text-align: left; }
+.setup-steps li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-2);
+  font-size: 13px;
+}
+.setup-steps li > svg { flex: none; color: var(--text-3); }
+.setup-steps li > span { flex: 1; min-width: 220px; }
+.setup-steps li.is-done > svg { color: var(--ok); }
+.setup-steps li.is-todo { border-color: rgba(229, 184, 75, 0.35); background: rgba(229, 184, 75, 0.08); }
+.setup-steps li.is-todo > svg, .setup-steps li.is-warn > svg { color: var(--warn); }
+.setup-steps strong { color: var(--text); font-weight: 600; }
+.login-actions { display: inline-flex; gap: 6px; flex: none; }
+.login-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 7px 10px 7px 16px;
+  font-size: 12.5px;
+  background: rgba(229, 184, 75, 0.1);
+  color: var(--text-2);
+  border-bottom: 1px solid rgba(229, 184, 75, 0.25);
+}
+.login-bar > svg { flex: none; color: var(--warn); }
+.login-bar > span { flex: 1; min-width: 240px; }
+.login-bar strong { color: var(--text); font-weight: 600; }
+
+/* ---------------------------------------------------------------- atalhos de teclado */
+
+.shortcuts { display: flex; flex-direction: column; gap: 16px; }
+.shortcuts h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--text-3); }
+.shortcuts dl { margin: 0; }
+.shortcut { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 12px; align-items: baseline; padding: 6px 0; border-top: 1px solid var(--border); }
+.shortcut:first-child { border-top: 0; }
+.shortcut dt, .shortcut dd { margin: 0; }
+.shortcut dd { color: var(--text-2); font-size: 12.5px; }
+
+/* ---------------------------------------------------------------- erro de interface */
+
+.crash { height: 100%; max-width: 640px; margin: 0 auto; padding: 32px 24px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; gap: 10px; }
+.crash h1 { margin: 0; font-size: 20px; }
+.crash p { margin: 0; color: var(--text-2); }
+.crash-detail {
+  align-self: stretch;
+  max-height: 30vh;
+  overflow: auto;
+  margin: 4px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(239, 107, 115, 0.35);
+  background: rgba(239, 107, 115, 0.08);
+  color: #ffc2c6;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.crash-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.crash-actions a { margin-left: 4px; font-size: 12.5px; }
+.crash.is-compact { height: auto; max-width: none; margin: 0; padding: 22px 24px; }
+.crash.is-compact h1 { font-size: 16px; }
+.drawer.is-crash { width: min(560px, calc(100vw - 16px)); min-width: 0; bottom: auto; }
+
+/* ---------------------------------------------------------------- movimento reduzido */
+
+/* Quem pede menos movimento no sistema não vê nada girando, piscando ou deslizando. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}

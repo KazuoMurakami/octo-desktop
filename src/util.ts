@@ -35,9 +35,13 @@ export function hue(text: string): string {
 const sep = (p: string) => (p.includes('\\') ? '\\' : '/');
 
 export function relativeTo(root: string, target: string): string {
-  const a = root.replace(/[\\/]+$/, '');
-  if (target.toLowerCase() === a.toLowerCase()) return '.';
-  return target.toLowerCase().startsWith(a.toLowerCase()) ? target.slice(a.length + 1).replace(/\\/g, '/') : target;
+  // "/" e "\" valem o mesmo (o Claude às vezes escreve C:/…), e "C:\proj" não contém "C:\projeto".
+  const normal = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
+  const a = normal(root);
+  const b = normal(target);
+  if (b.toLowerCase() === a.toLowerCase()) return '.';
+  if (!a) return b.replace(/^\//, ''); // raiz "/"
+  return b.toLowerCase().startsWith(`${a.toLowerCase()}/`) ? b.slice(a.length + 1) : target;
 }
 
 export function isUnder(dir: string, target: string): boolean {
@@ -90,4 +94,43 @@ export function shortRepoName(repo: Repo): string {
 export function isTyping(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return Boolean(el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable));
+}
+
+const TEXT_INPUTS = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number']);
+
+/** Campo de texto livre (input de texto, textarea ou editável); checkbox, botão etc. não contam. */
+export function isTextField(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el?.tagName) return false;
+  if (el.tagName === 'TEXTAREA') return true;
+  if (el.tagName === 'INPUT') return TEXT_INPUTS.has((el as HTMLInputElement).type);
+  return el.isContentEditable;
+}
+
+/**
+ * Primeiro Esc num campo com texto: só tira o foco dele, para um Esc por hábito não fechar
+ * o painel ou o modal com o rascunho. O Esc seguinte fecha. Devolve true se tirou o foco.
+ */
+export function leaveTextField(target: EventTarget | null): boolean {
+  if (!isTextField(target)) return false;
+  const el = target as HTMLElement;
+  const text = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : (el.textContent ?? '');
+  if (!text.trim()) return false;
+  // Dentro de um modal ou painel, o foco vai para ele (e não para o <body>, fora do diálogo).
+  const dialog = el.closest<HTMLElement>('[role="dialog"][tabindex]');
+  if (dialog) dialog.focus({ preventScroll: true });
+  else el.blur();
+  return true;
+}
+
+/** macOS (no navegador ou no app desktop). */
+export function isMac(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const hints = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
+  return /mac|iphone|ipad/i.test(hints?.platform || navigator.platform || navigator.userAgent);
+}
+
+/** Tecla dos atalhos como aparece na tela: ⌘ no macOS, Ctrl nos outros sistemas (os atalhos aceitam as duas). */
+export function modKey(): string {
+  return isMac() ? '⌘' : 'Ctrl';
 }

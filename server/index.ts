@@ -1,14 +1,17 @@
 // Octo pela linha de comando (`npm start`, `npm run dev`): o mesmo servidor do app desktop, aberto no navegador.
-import { spawn } from 'node:child_process';
 import { apiToken, findRunningServer } from './instance.ts';
+import { baseEnv, launchDetached } from './system.ts';
 
 const open = process.argv.includes('--open');
 const dev = process.argv.includes('--dev');
 
+/** Abre o navegador; sem um (ex.: Linux sem xdg-open, WSL), só mostra o endereço para copiar. */
 function openBrowser(url: string): void {
   const [command, args] =
     process.platform === 'win32' ? ['cmd.exe', ['/c', 'start', '', url]] : [process.platform === 'darwin' ? 'open' : 'xdg-open', [url]];
-  spawn(command as string, args as string[], { stdio: 'ignore', detached: true }).unref();
+  launchDetached(command as string, args as string[], { detached: true, env: baseEnv() }).catch(() => {
+    console.log(`  Não foi possível abrir o navegador. Abra este endereço: ${url}\n`);
+  });
 }
 
 const running = await findRunningServer();
@@ -37,7 +40,12 @@ try {
   process.exit(1);
 }
 
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+// No Windows, fechar a janela do console (SIGHUP) e o Ctrl+Break (SIGBREAK) também encerram o Octo:
+// sem tratar, as últimas mudanças não chegam ao db.json. No macOS e no Linux o SIGHUP fica com o
+// comportamento padrão, que respeita o nohup.
+const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+if (process.platform === 'win32') signals.push('SIGHUP', 'SIGBREAK');
+for (const signal of signals) {
   process.on(signal, () => {
     shutdown();
     process.exit(0);

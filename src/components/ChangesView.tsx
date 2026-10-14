@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ChevronRight, FileWarning, GitBranch, RefreshCw } from 'lucide-react';
 import type { FileChange, FileChangeStatus, RepoChanges } from '../../shared/types.ts';
 import { hue } from '../util.ts';
@@ -41,13 +41,22 @@ function FileRow({ file, open, onToggle }: { file: FileChange; open: boolean; on
   const expandable = Boolean(file.patch);
   return (
     <div className={`change-file${open ? ' is-open' : ''}`}>
-      <button className="change-row" onClick={onToggle} disabled={!expandable} title={file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}>
+      {/* Sem o diff (grande demais), a linha ainda abre para dizer por quê; só a de um binário não tem o que mostrar. */}
+      <button className="change-row" onClick={onToggle} disabled={!expandable && file.binary} title={file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}>
         <ChevronRight size={13} className="change-chevron" />
         <span className={`change-status is-${file.status}`} title={status.label}>{status.letter}</span>
         <span className="change-path">
           {slash > -1 && <span className="dim">{file.path.slice(0, slash + 1)}</span>}
           {file.path.slice(slash + 1)}
         </span>
+        {file.preexisting && (
+          <span
+            className="change-badge"
+            title="Já tinha alterações sem commit quando a sessão começou e não mudou desde então: provavelmente não foi o agente."
+          >
+            já estava alterado
+          </span>
+        )}
         <span className="change-counts">
           {file.binary ? <span className="dim">binário</span> : (
             <>
@@ -65,10 +74,18 @@ function FileRow({ file, open, onToggle }: { file: FileChange; open: boolean; on
 
 /**
  * O que mudou desde o último commit em cada repositório (o mesmo que `git diff HEAD`),
- * incluindo arquivos novos. Só leitura.
+ * incluindo arquivos novos. Só leitura. Na aba da sessão, os arquivos que já estavam alterados
+ * quando ela começou ficam separados no fim de cada repositório.
  */
-export function ChangesView({ fetcher, target, emptyText }: { fetcher: () => Promise<RepoChanges[]>; target: OpenTarget; emptyText: string }) {
+export function ChangesView({ fetcher, target, emptyText, note }: {
+  fetcher: () => Promise<RepoChanges[]>;
+  target: OpenTarget;
+  emptyText: string;
+  /** Explicação fixa abaixo do resumo (ex.: o que a aba da sessão inclui). */
+  note?: ReactNode;
+}) {
   const [repos, setRepos] = useState<RepoChanges[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
 
@@ -76,8 +93,9 @@ export function ChangesView({ fetcher, target, emptyText }: { fetcher: () => Pro
     setLoading(true);
     try {
       setRepos(await fetcher());
-    } catch {
-      setRepos((current) => current ?? []);
+      setError(null);
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
       setLoading(false);
     }
@@ -87,8 +105,9 @@ export function ChangesView({ fetcher, target, emptyText }: { fetcher: () => Pro
     void refresh();
   }, [refresh]);
 
-  const changed = (repos ?? []).filter((r) => r.files.length || r.error);
+  const changed = (repos ?? []).filter((r) => r.files.length || r.omittedFiles || r.error);
   const files = changed.reduce((n, r) => n + r.files.length, 0);
+  const preexisting = changed.reduce((n, r) => n + r.files.filter((f) => f.preexisting).length, 0);
   const additions = changed.reduce((n, r) => n + r.files.reduce((m, f) => m + f.additions, 0), 0);
   const deletions = changed.reduce((n, r) => n + r.files.reduce((m, f) => m + f.deletions, 0), 0);
   const toggle = (key: string) =>
@@ -103,38 +122,72 @@ export function ChangesView({ fetcher, target, emptyText }: { fetcher: () => Pro
     <div className="changes">
       <div className="changes-head">
         <span className="changes-summary">
-          {repos === null ? 'Lendo os repositórios…' : files ? (
+          {repos === null ? (error ? 'Não foi possível ler as mudanças.' : 'Lendo os repositórios…') : files ? (
             <>
               <strong>{files} {files === 1 ? 'arquivo' : 'arquivos'}</strong> em {changed.length} {changed.length === 1 ? 'repositório' : 'repositórios'}
               {additions > 0 && <em className="is-add"> +{additions}</em>}
               {deletions > 0 && <em className="is-del"> −{deletions}</em>}
+              {preexisting > 0 && (
+                <span className="dim">
+                  {' · '}
+                  {preexisting === files
+                    ? files === 1 ? 'já estava alterado antes da sessão' : 'todos já estavam alterados antes da sessão'
+                    : `${preexisting} já ${preexisting === 1 ? 'estava alterado' : 'estavam alterados'} antes da sessão`}
+                </span>
+              )}
             </>
           ) : 'Sem mudanças'}
         </span>
-        <button className="icon-btn" onClick={() => void refresh()} disabled={loading} title="Atualizar">
+        <button className="icon-btn" onClick={() => void refresh()} disabled={loading} title="Atualizar" aria-label="Atualizar">
           <RefreshCw size={14} className={loading ? 'spin' : ''} />
         </button>
         <OpenMenu target={target} />
       </div>
+      {note && <p className="changes-note">{note}</p>}
+
+      {error && (
+        <div className="inline-error">
+          {repos === null ? 'Não foi possível ler as mudanças' : 'Não foi possível atualizar'}: {error}{' '}
+          <button className="link-btn" onClick={() => void refresh()} disabled={loading}>Tentar de novo</button>
+        </div>
+      )}
 
       {repos !== null && !changed.length && <div className="changes-empty">{emptyText}</div>}
 
-      {changed.map((repo) => (
-        <section key={repo.repoId} className="changes-repo">
-          <header className="changes-repo-head">
-            <i style={{ background: hue(repo.name) }} />
-            <strong>{repo.name}</strong>
-            {repo.branch && <span className="dim mono with-icon"><GitBranch size={12} /> {repo.branch}</span>}
-            <button className="link-btn" onClick={() => void openInEditor({ kind: 'folder', workspaceId: target.workspaceId, dir: repo.absPath })}>abrir no editor</button>
-          </header>
-          {repo.error && <div className="change-note is-error"><FileWarning size={13} /> {repo.error}</div>}
-          {repo.files.map((file) => {
-            const key = `${repo.repoId}:${file.path}`;
-            return <FileRow key={key} file={file} open={open.has(key)} onToggle={() => toggle(key)} />;
-          })}
-          {repo.truncated && <div className="change-note">O diff é grande: alguns arquivos aparecem sem o conteúdo. Abra no editor para ver tudo.</div>}
-        </section>
-      ))}
+      {changed.map((repo) => {
+        // Primeiro o que mudou durante a sessão; depois o que já estava alterado quando ela começou.
+        const fresh = repo.files.filter((f) => !f.preexisting);
+        const before = repo.files.filter((f) => f.preexisting);
+        const row = (file: FileChange) => {
+          const key = `${repo.repoId}:${file.path}`;
+          return <FileRow key={key} file={file} open={open.has(key)} onToggle={() => toggle(key)} />;
+        };
+        return (
+          <section key={repo.repoId} className="changes-repo">
+            <header className="changes-repo-head">
+              <i style={{ background: hue(repo.name) }} />
+              <strong>{repo.name}</strong>
+              {repo.branch && <span className="dim mono with-icon"><GitBranch size={12} /> {repo.branch}</span>}
+              <button className="link-btn" onClick={() => void openInEditor({ kind: 'folder', workspaceId: target.workspaceId, dir: repo.absPath })}>abrir no editor</button>
+            </header>
+            {repo.error && <div className="change-note is-error"><FileWarning size={13} /> {repo.error}</div>}
+            {fresh.map(row)}
+            {before.length > 0 && (
+              <div className="change-group-head">
+                Já {before.length === 1 ? 'estava alterado' : 'estavam alterados'} antes da sessão começar
+              </div>
+            )}
+            {before.map(row)}
+            {Boolean(repo.omittedFiles) && (
+              <div className="change-note">
+                Mais {repo.omittedFiles} {repo.omittedFiles === 1 ? 'arquivo alterado ficou' : 'arquivos alterados ficaram'} fora da lista, por serem muitos
+                (dependências fora do .gitignore, por exemplo). Abra no editor para ver tudo.
+              </div>
+            )}
+            {repo.truncated && <div className="change-note">O diff é grande: alguns arquivos aparecem sem o conteúdo. Abra no editor para ver tudo.</div>}
+          </section>
+        );
+      })}
     </div>
   );
 }

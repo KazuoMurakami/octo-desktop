@@ -39,7 +39,8 @@ export const PERMISSION_LABEL: Record<PermissionMode, string> = {
 export const PERMISSION_HELP: Record<PermissionMode, string> = {
   plan: 'Só lê e planeja. Bom para investigar e propor uma abordagem.',
   manual: 'Pede permissão para editar e rodar comandos. Em segundo plano, o pedido aparece na issue.',
-  acceptEdits: 'Edita arquivos livremente; comandos de terminal pedem sua permissão.',
+  acceptEdits:
+    'Edita arquivos sem perguntar. Comandos (npm, git…) pedem permissão: no terminal, na hora; em segundo plano, ficam bloqueados e aparecem na issue ao final, para você liberar com “Permitir e continuar”.',
   auto: 'O Claude decide sozinho o que é seguro executar.',
   dontAsk: 'Nunca pergunta: o que não estiver liberado nas configurações é negado.',
   bypassPermissions: 'Executa tudo sem perguntar. Use só em pastas descartáveis.',
@@ -164,6 +165,11 @@ export interface Issue {
   repoIds: string[];
   /** Conta do Claude a quem a issue foi delegada (o "Delegate" do Linear). */
   delegateAccountId: string | null;
+  /**
+   * Uma sessão concluiu enquanto outra desta issue ainda rodava: a issue vai para Em revisão
+   * quando a última terminar, seja como for (concluída, com erro ou interrompida).
+   */
+  reviewPending: boolean;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;
@@ -204,6 +210,11 @@ export interface AgentSession extends SessionSettings {
   touchedRepoIds: string[];
   pendingDenials: PermissionDenial[];
   lastError: string | null;
+  /**
+   * Quando o Octo registrou o que já estava alterado (sem commit) nos repositórios, no início da
+   * sessão. Com ele, a aba Mudanças marca `preexisting`. Ausente em sessões antigas.
+   */
+  baselineAt?: string | null;
 }
 
 export type ActivityType = 'prompt' | 'thought' | 'message' | 'action' | 'result' | 'system' | 'error' | 'response';
@@ -282,6 +293,12 @@ export interface FileChange {
   binary: boolean;
   /** Diff unificado do arquivo ('' quando binário ou cortado por tamanho). */
   patch: string;
+  /**
+   * Só nas mudanças de uma sessão: true quando o arquivo já tinha alterações sem commit no
+   * momento em que a sessão começou (e não mudou desde então); false quando a mudança é desta
+   * sessão. Ausente quando não há registro do início (sessões antigas, mudanças de pasta).
+   */
+  preexisting?: boolean;
 }
 
 export interface RepoChanges {
@@ -290,8 +307,10 @@ export interface RepoChanges {
   absPath: string;
   branch: string | null;
   files: FileChange[];
-  /** O diff era grande demais e parte dos arquivos veio sem o conteúdo. */
+  /** O diff era grande demais e parte dos arquivos veio sem o conteúdo (ou ficou de fora). */
   truncated: boolean;
+  /** Arquivos alterados que nem entraram na lista, por serem muitos (ex.: dependências fora do .gitignore). */
+  omittedFiles?: number;
   error: string | null;
 }
 
@@ -308,6 +327,8 @@ export interface AppMeta {
   /** O `claude` do terminal está quebrado, mas o Octo achou outro executável que funciona. */
   claudeWarning: string | null;
   dataDir: string;
+  /** O db.json estava danificado ao abrir: o que o Octo fez (restaurou a cópia ou começou vazio). */
+  dbNotice?: string | null;
 }
 
 export type ServerEvent =

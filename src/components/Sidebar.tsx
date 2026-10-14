@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, ChevronDown, ChevronRight, FolderGit2, FolderPlus, Inbox, KeyRound, Search, Settings2, SlidersHorizontal, Sparkles, SquareTerminal, X } from 'lucide-react';
 import type { UpdateInfo } from '../../shared/types.ts';
 import { useShallow } from 'zustand/react/shallow';
 import { api } from '../api.ts';
+import { openClaudeIn } from '../integrations.ts';
 import { defaultAccountId, useStore, useWorkspace, useWorkspaceRepos, type View } from '../store.ts';
-import { hue, repoGroups, shortRepoName } from '../util.ts';
+import { hue, modKey, repoGroups, shortRepoName } from '../util.ts';
+import { loginHint } from './AccountsView.tsx';
 import { AccountAvatar, OrbitMark } from './icons.tsx';
 import { Kbd, Menu } from './ui.tsx';
 
@@ -16,7 +18,11 @@ const NAV: { view: View; label: string; icon: typeof Inbox }[] = [
   { view: 'claude', label: 'Configuração do Claude', icon: SlidersHorizontal },
 ];
 
-export function Sidebar() {
+/**
+ * Navegação lateral. Em janelas estreitas ela vira uma gaveta (`drawer` = gaveta aberta),
+ * aberta pelo botão da barra do topo.
+ */
+export function Sidebar({ inert = false, drawer = false }: { inert?: boolean; drawer?: boolean }) {
   const workspace = useWorkspace();
   const repos = useWorkspaceRepos();
   const { workspaces, accounts, accountStatus, issues, sessions, view, repoFilter, set, selectWorkspace } = useStore(
@@ -26,6 +32,13 @@ export function Sidebar() {
     })),
   );
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [launching, setLaunching] = useState(false);
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  // A gaveta abriu: o foco entra nela.
+  useEffect(() => {
+    if (drawer) closeRef.current?.focus();
+  }, [drawer]);
 
   const groups = useMemo(() => (workspace ? repoGroups(workspace, repos) : []), [workspace, repos]);
   const loose = repos.filter((r) => !groups.some((g) => g.repos.includes(r)));
@@ -37,12 +50,19 @@ export function Sidebar() {
 
   const filterBy = (repoId: string) => set({ view: 'issues', repoFilter: repoFilter === repoId ? null : repoId });
 
+  const launch = () => {
+    if (!workspace || launching) return;
+    setLaunching(true);
+    void openClaudeIn(workspace.id).finally(() => setTimeout(() => setLaunching(false), 2000));
+  };
+
   const repoRow = (repo: (typeof repos)[number], nested: boolean) => (
     <button
       key={repo.id}
       className={`side-repo${repoFilter === repo.id ? ' is-active' : ''}${nested ? ' is-nested' : ''}`}
       onClick={() => filterBy(repo.id)}
       title={repo.absPath}
+      aria-pressed={repoFilter === repo.id}
     >
       <i style={{ background: hue(repo.name) }} />
       <span>{shortRepoName(repo)}</span>
@@ -51,43 +71,53 @@ export function Sidebar() {
   );
 
   return (
-    <aside className="sidebar">
-      <Menu
-        className="ws-switcher"
-        width={280}
-        trigger={
-          <>
-            <span className="ws-mark">{workspace?.key.slice(0, 2) ?? 'OC'}</span>
-            <span className="ws-name">{workspace?.name ?? 'Octo'}</span>
-            <ChevronDown size={14} className="dim" />
-          </>
-        }
-        items={[
-          ...workspaces.map((w) => ({
-            key: w.id,
-            label: w.name,
-            hint: w.key,
-            icon: <span className="ws-mark is-small">{w.key.slice(0, 2)}</span>,
-            selected: w.id === workspace?.id,
-            onSelect: () => selectWorkspace(w.id),
-          })),
-          { key: 'new', label: 'Conectar outra pasta…', icon: <FolderPlus size={14} />, onSelect: () => set({ modal: { kind: 'workspace' } }) },
-        ]}
-      />
+    <aside id="octo-sidebar" className="sidebar" inert={inert} aria-label="Navegação">
+      <div className="side-top">
+        <Menu
+          className="ws-switcher"
+          width={280}
+          trigger={
+            <>
+              <span className="ws-mark">{workspace?.key.slice(0, 2) ?? 'OC'}</span>
+              <span className="ws-name">{workspace?.name ?? 'Octo'}</span>
+              <ChevronDown size={14} className="dim" />
+            </>
+          }
+          items={[
+            ...workspaces.map((w) => ({
+              key: w.id,
+              label: w.name,
+              hint: w.key,
+              icon: <span className="ws-mark is-small">{w.key.slice(0, 2)}</span>,
+              selected: w.id === workspace?.id,
+              onSelect: () => selectWorkspace(w.id),
+            })),
+            { key: 'new', label: 'Conectar outra pasta…', icon: <FolderPlus size={14} />, onSelect: () => set({ modal: { kind: 'workspace' } }) },
+          ]}
+        />
+        <button ref={closeRef} type="button" className="icon-btn side-close" aria-label="Fechar navegação" title="Fechar (Esc)" onClick={() => set({ navOpen: false })}>
+          <X size={16} />
+        </button>
+      </div>
 
       <button className="side-search" onClick={() => set({ paletteOpen: true })}>
         <Search size={14} />
         <span>Buscar ou executar…</span>
-        <Kbd>Ctrl K</Kbd>
+        <Kbd>{modKey()} K</Kbd>
       </button>
 
       <nav className="side-nav">
         {NAV.map(({ view: v, label, icon: Icon }) => (
-          <button key={v} className={`side-link${view === v ? ' is-active' : ''}`} onClick={() => set({ view: v, ...(v !== 'issues' && { repoFilter: null }) })}>
+          <button
+            key={v}
+            className={`side-link${view === v ? ' is-active' : ''}`}
+            aria-current={view === v ? 'page' : undefined}
+            onClick={() => set({ view: v, ...(v !== 'issues' && { repoFilter: null }) })}
+          >
             <Icon size={15} />
             <span>{label}</span>
-            {v === 'sessions' && running > 0 && <em className="is-live"><OrbitMark size={11} active />{running}</em>}
-            {v === 'sessions' && waiting > 0 && <em className="is-waiting">{waiting}</em>}
+            {v === 'sessions' && running > 0 && <em className="is-live" title={`${running} trabalhando`}><OrbitMark size={11} active />{running}</em>}
+            {v === 'sessions' && waiting > 0 && <em className="is-waiting" title={`${waiting} aguardando você`}>{waiting}</em>}
           </button>
         ))}
       </nav>
@@ -103,7 +133,11 @@ export function Sidebar() {
               const isCollapsed = collapsed[group.rel] ?? group.repos.length > 4;
               return (
                 <div key={group.rel} className="side-group">
-                  <button className="side-group-head" onClick={() => setCollapsed((c) => ({ ...c, [group.rel]: !isCollapsed }))}>
+                  <button
+                    className="side-group-head"
+                    aria-expanded={!isCollapsed}
+                    onClick={() => setCollapsed((c) => ({ ...c, [group.rel]: !isCollapsed }))}
+                  >
                     {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
                     <span>{group.rel}</span>
                     <em className="dim">{group.repos.length}</em>
@@ -124,26 +158,29 @@ export function Sidebar() {
           <button
             className="launch"
             title="Abre um terminal na raiz do workspace já rodando o Claude com o mapa de todos os repositórios"
-            onClick={() => api.openTerminal(workspace.id, { accountId: defaultAccountId() })}
+            onClick={launch}
+            disabled={launching}
+            aria-busy={launching}
           >
             <SquareTerminal size={15} />
             <span>
-              <strong>Abrir Claude na raiz</strong>
+              <strong>{launching ? 'Abrindo terminal…' : 'Abrir Claude na raiz'}</strong>
               <small>{workspace.rootPath.split(/[\\/]/).at(-1)} · {repos.length} repos</small>
             </span>
           </button>
-          <button className="launch-prefs" title="Preferências: terminal e editor" onClick={() => set({ modal: { kind: 'preferences' } })}>
+          <button className="launch-prefs" title="Preferências: terminal e editor" aria-label="Preferências" onClick={() => set({ modal: { kind: 'preferences' } })}>
             <Settings2 size={16} />
           </button>
           <Menu
             className="launch-account"
             align="end"
             width={260}
+            label={`Conta padrão do workspace: ${account?.name ?? 'nenhuma'}`}
             trigger={<AccountAvatar account={account} status={account ? accountStatus[account.id] : undefined} size={22} />}
             items={accounts.map((a) => ({
               key: a.id,
               label: a.name,
-              hint: accountStatus[a.id]?.email ?? 'sem login',
+              hint: loginHint(accountStatus[a.id]),
               icon: <AccountAvatar account={a} size={16} />,
               selected: a.id === account?.id,
               onSelect: () => api.updateWorkspace(workspace.id, { defaultAccountId: a.id }),
@@ -196,7 +233,7 @@ function UpdateBanner() {
         <small>você tem a {info.current}</small>
       </span>
       <a className="primary-btn is-small" href={info.url} target="_blank" rel="noreferrer">Baixar</a>
-      <button className="icon-btn" title="Dispensar este aviso" onClick={dismiss}><X size={13} /></button>
+      <button className="icon-btn" title="Dispensar este aviso" aria-label="Dispensar este aviso" onClick={dismiss}><X size={13} /></button>
     </div>
   );
 }

@@ -1,17 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertTriangle, ChevronRight, CornerDownLeft, FileDiff, FileEdit, FolderOpen, FilePlus, FileText, Globe, ListChecks, MessageSquare, RefreshCw,
-  Search, ShieldQuestion, Square, SquareTerminal, TerminalSquare, Users, Wrench,
+  AlertTriangle, ChevronRight, CircleCheck, CornerDownLeft, FileDiff, FileEdit, FolderOpen, FilePlus, FileText, Globe, ListChecks, MessageSquare,
+  RefreshCw, Search, ShieldQuestion, Square, SquareTerminal, TerminalSquare, Users, Wrench,
 } from 'lucide-react';
-import { EFFORT_LABEL, PERMISSION_LABEL, type Activity, type AgentSession as Session, type SessionSettings } from '../../shared/types.ts';
+import {
+  EFFORT_LABEL, PERMISSION_HELP, PERMISSION_LABEL, type Activity, type AgentSession as Session, type Repo, type SessionSettings,
+} from '../../shared/types.ts';
 import { api, type SettingsInput } from '../api.ts';
 import { setting, useAccountConfig } from '../claudeConfig.ts';
 import { terminalLabel, useIntegrations } from '../integrations.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
-import { ago, duration, isUnder, money, relativeTo } from '../util.ts';
+import { ago, duration, isUnder, modKey } from '../util.ts';
+import { Cost, usesSubscription } from './AccountsView.tsx';
 import { ChangesView } from './ChangesView.tsx';
 import { AccountAvatar, OrbitMark, SessionBadge } from './icons.tsx';
-import { OpenMenu } from './OpenMenu.tsx';
+import { ConfirmDialog } from './modals.tsx';
+import { OpenMenu, folderLabel } from './OpenMenu.tsx';
 import { EffortPicker, ModelPicker, PermissionPicker, modelLabel } from './SessionSettings.tsx';
 import { AutoTextarea, Kbd, Markdown, RepoChip } from './ui.tsx';
 
@@ -21,39 +25,77 @@ const TOOL_ICON: Record<string, typeof Wrench> = {
   Task: Users, Agent: Users, TodoWrite: ListChecks,
 };
 
-export function useActivities(sessionId: string | undefined): Activity[] | undefined {
-  const activities = useStore((s) => (sessionId ? s.activities[sessionId] : undefined));
+type RepoMap = Map<string, Repo>;
+
+/** Rascunho da resposta por sessão: fechar o painel ou trocar de sessão não apaga o que você escreveu. */
+const composerDrafts = new Map<string, string>();
+
+/** Troca as atividades de uma sessão que continua na tela (o painel pode ter fechado durante a busca). */
+function replaceActivities(sessionId: string, list: Activity[]): void {
+  const s = useStore.getState();
+  if (s.activities[sessionId]) s.setActivities(sessionId, list);
+}
+
+/** Atividades da sessão, com o estado da primeira carga (e "Tentar de novo" se ela falhar). */
+export function useActivities(sessionId: string): { activities: Activity[] | undefined; load: 'loading' | 'ready' | 'error'; retry: () => void } {
+  const activities = useStore((s) => s.activities[sessionId]);
+  const [load, setLoad] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
-    if (!sessionId) return;
+    let alive = true;
     // Começa a acompanhar a sessão já, para não perder eventos que chegam antes do snapshot.
     const s = useStore.getState();
     if (!s.activities[sessionId]) s.setActivities(sessionId, []);
-    api.activities(sessionId).then((list) => useStore.getState().mergeActivities(sessionId, list)).catch(() => undefined);
-  }, [sessionId]);
-  return activities;
+    setLoad('loading');
+    api.activities(sessionId, true)
+      .then((list) => {
+        useStore.getState().mergeActivities(sessionId, list);
+        if (alive) setLoad('ready');
+      })
+      .catch(() => alive && setLoad('error'));
+    return () => {
+      alive = false;
+    };
+  }, [sessionId, attempt]);
+  const retry = useCallback(() => setAttempt((n) => n + 1), []);
+  return { activities, load, retry };
 }
 
-/** Cabeçalho + feed + caixa de resposta de uma sessão de agente (o "agent session" do Linear). */
-export function AgentSessionView({ session }: { session: Session }) {
+/**
+ * Cabeçalho + feed + caixa de resposta de uma sessão de agente (o "agent session" do Linear).
+ * Memoizado: eventos de outras sessões não redesenham este feed.
+ */
+export const AgentSessionView = memo(function AgentSessionView({ session }: { session: Session }) {
   const workspace = useWorkspace();
   const repos = useWorkspaceRepos();
   const account = useStore((s) => s.accounts.find((a) => a.id === session.accountId));
   const status = useStore((s) => s.accountStatus[session.accountId]);
-  const activities = useActivities(session.id);
+  const { activities, load, retry } = useActivities(session.id);
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [syncing, setSyncing] = useState(false);
+  const [finishing, setFinishing] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const [askResume, setAskResume] = useState(false);
   const [tab, setTab] = useState<'activity' | 'changes'>('activity');
   const integrations = useIntegrations();
-  const fetchChanges = useCallback(() => api.sessionChanges(session.id), [session.id]);
+  const fetchChanges = useCallback(() => api.sessionChanges(session.id, true), [session.id]);
 
   const live = session.state === 'active' || session.state === 'pending';
+  const inTerminal = session.state === 'terminal';
+  // Já foi aberta no terminal (mesmo se marcada como concluída depois): aquela janela pode continuar aberta nesta conversa.
+  const openedInTerminal = session.mode === 'terminal';
+  const terminal = terminalLabel(integrations);
   const repoMap = useMemo(() => new Map(repos.map((r) => [r.id, r])), [repos]);
   const inScope = repos.filter((r) => isUnder(session.cwd, r.absPath));
 
   // Sessões no terminal: puxa o andamento do transcript ao abrir.
   useEffect(() => {
-    if (session.state === 'terminal') void api.sync(session.id).then(() => api.activities(session.id)).then((list) => useStore.getState().setActivities(session.id, list));
+    if (session.state !== 'terminal') return;
+    api.sync(session.id)
+      .then(() => api.activities(session.id, true))
+      .then((list) => replaceActivities(session.id, list))
+      .catch(() => undefined);
   }, [session.id, session.state]);
 
   useEffect(() => {
@@ -61,14 +103,45 @@ export function AgentSessionView({ session }: { session: Session }) {
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [activities?.length]);
 
+  const reload = () => api.activities(session.id, true).then((list) => replaceActivities(session.id, list));
+
   const sync = async () => {
     setSyncing(true);
     try {
       const { count } = await api.sync(session.id);
-      useStore.getState().setActivities(session.id, await api.activities(session.id));
+      await reload();
       if (!count) toast('Ainda não há conversa registrada no terminal para esta sessão.');
+    } catch {
+      /* o aviso de erro já apareceu (api.ts) */
     } finally {
       setSyncing(false);
+    }
+  };
+
+  // Enquanto o terminal abre, a caixa de resposta não envia: as duas coisas mexeriam na mesma conversa.
+  const openInTerminal = async () => {
+    setResuming(true);
+    try {
+      await api.resumeInTerminal(session.id);
+      toast(`Conversa aberta no ${terminal}.`, 'success');
+    } finally {
+      setResuming(false);
+    }
+  };
+  const resume = () => openInTerminal().catch(() => undefined); // o aviso de erro já apareceu
+
+  // Terminou no terminal: traz o fim da conversa e tira a sessão de "No terminal".
+  const finish = async () => {
+    setFinishing(true);
+    try {
+      await api.sync(session.id).catch(() => undefined);
+      await api.finish(session.id);
+      await reload().catch(() => undefined);
+      toast('Sessão marcada como concluída.', 'success');
+    } catch {
+      /* o aviso de erro já apareceu */
+    } finally {
+      setFinishing(false);
     }
   };
 
@@ -80,34 +153,49 @@ export function AgentSessionView({ session }: { session: Session }) {
           <div className="agent-head-row">
             <strong>{account?.name ?? 'Conta removida'}</strong>
             <SessionBadge state={session.state} />
-            <span className="dim">{PERMISSION_LABEL[session.permissionMode]}</span>
+            {session.permissionMode === 'bypassPermissions' ? (
+              <span className="tag is-danger" title={PERMISSION_HELP.bypassPermissions}>{PERMISSION_LABEL.bypassPermissions}</span>
+            ) : (
+              <span className="dim">{PERMISSION_LABEL[session.permissionMode]}</span>
+            )}
           </div>
           <div className="agent-head-row dim">
-            <span className="mono with-icon" title={session.cwd}><FolderOpen size={12} /> {workspace ? relativeTo(workspace.rootPath, session.cwd) : session.cwd}</span>
+            <span className="mono with-icon" title={session.cwd}><FolderOpen size={12} /> {workspace ? folderLabel(workspace, session.cwd) : session.cwd}</span>
             <span className="mono" title={session.model ? `Escolhido: ${session.model}` : 'Padrão da conta'}>{session.activeModel ?? modelLabel(session.model)}</span>
-            {session.effort && <span>effort {EFFORT_LABEL[session.effort].toLowerCase()}</span>}
+            {session.effort && <span>effort {(EFFORT_LABEL[session.effort] ?? session.effort).toLowerCase()}</span>}
             {session.agent && <span className="mono">@{session.agent}</span>}
-            <span>{money(session.costUsd)}</span>
+            <Cost usd={session.costUsd} subscription={usesSubscription(status)} />
             <span>{duration(session.durationMs)}</span>
             <span>{ago(session.startedAt)}</span>
           </div>
         </div>
         <div className="agent-actions">
           {live && (
-            <button className="ghost-btn is-danger" onClick={() => api.stop(session.id)}><Square size={13} /> Parar</button>
+            <button className="ghost-btn is-danger" onClick={() => void api.stop(session.id).catch(() => undefined)}><Square size={13} /> Parar</button>
+          )}
+          {inTerminal && (
+            <button
+              className="ghost-btn"
+              onClick={() => void finish()}
+              disabled={finishing}
+              title="Terminou no terminal? Marca a sessão como concluída. Se a issue estava Em andamento, ela vai para Em revisão."
+            >
+              <CircleCheck size={13} /> {finishing ? 'Concluindo…' : 'Marcar como concluída'}
+            </button>
           )}
           {!live && (
             <button
               className="ghost-btn"
-              onClick={() => api.resumeInTerminal(session.id).then(() => toast(`Conversa aberta no ${terminalLabel(integrations)}.`, 'success'))}
-              title="Abre esta mesma conversa no seu terminal (claude --resume), com a mesma conta e as mesmas opções"
+              disabled={resuming || !account}
+              onClick={() => (openedInTerminal ? setAskResume(true) : void resume())}
+              title={account ? 'Abre esta mesma conversa no seu terminal (claude --resume), com a mesma conta e as mesmas opções' : 'A conta desta sessão foi removida do Octo.'}
             >
-              <SquareTerminal size={13} /> Continuar no {terminalLabel(integrations)}
+              <SquareTerminal size={13} /> Continuar no {terminal}
             </button>
           )}
           {workspace && <OpenMenu target={{ kind: 'session', sessionId: session.id, workspaceId: workspace.id, dir: session.cwd }} className="ghost-btn" />}
-          {session.state === 'terminal' && (
-            <button className="ghost-btn" onClick={sync} disabled={syncing} title="Traz o andamento da sessão do terminal para cá">
+          {inTerminal && (
+            <button className="ghost-btn" onClick={() => void sync()} disabled={syncing} title="Traz o andamento da sessão do terminal para cá">
               <RefreshCw size={13} className={syncing ? 'spin' : ''} /> Sincronizar
             </button>
           )}
@@ -117,8 +205,11 @@ export function AgentSessionView({ session }: { session: Session }) {
       {/* Os repositórios ao alcance da sessão acendem conforme o Claude os toca. */}
       <div className="repo-rail">
         <span className="rail-label"><OrbitMark size={13} active={live} /> contexto</span>
-        {inScope.map((repo) => <RepoChip key={repo.id} repo={repo} lit={session.touchedRepoIds.includes(repo.id)} />)}
-        {!inScope.length && <span className="dim">nenhum repositório nesta pasta</span>}
+        {/* Só os repositórios rolam: com muitos na pasta, as abas continuam à vista. */}
+        <div className="repo-rail-chips">
+          {inScope.map((repo) => <RepoChip key={repo.id} repo={repo} lit={session.touchedRepoIds.includes(repo.id)} />)}
+          {!inScope.length && <span className="dim">nenhum repositório nesta pasta</span>}
+        </div>
         <div className="segmented agent-tabs">
           <button className={tab === 'activity' ? 'is-on' : ''} onClick={() => setTab('activity')}><MessageSquare size={13} /> Atividade</button>
           <button className={tab === 'changes' ? 'is-on' : ''} onClick={() => setTab('changes')}><FileDiff size={13} /> Mudanças</button>
@@ -131,6 +222,9 @@ export function AgentSessionView({ session }: { session: Session }) {
             fetcher={fetchChanges}
             target={{ kind: 'session', sessionId: session.id, workspaceId: workspace.id, dir: session.cwd }}
             emptyText="Nenhuma mudança desde o último commit nos repositórios desta sessão."
+            note={session.baselineAt
+              ? 'Tudo que está sem commit nos repositórios desta sessão, comparado ao último commit. O que já estava alterado antes de ela começar fica separado, no fim de cada repositório.'
+              : 'Tudo que está sem commit nos repositórios desta sessão, comparado ao último commit, inclusive o que já estava alterado antes de ela começar (esta sessão não tem o registro de como os arquivos estavam no início).'}
           />
         </div>
       )}
@@ -144,7 +238,12 @@ export function AgentSessionView({ session }: { session: Session }) {
           stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}
       >
-        {!activities && <div className="feed-loading">Carregando atividade…</div>}
+        {!activities?.length && load === 'loading' && <div className="feed-loading">Carregando atividade…</div>}
+        {load === 'error' && (
+          <div className="inline-error">
+            Não foi possível carregar a atividade desta sessão. <button className="link-btn" onClick={retry}>Tentar de novo</button>
+          </div>
+        )}
         {activities && <Feed activities={activities} repoMap={repoMap} />}
         {live && (
           <div className="feed-working"><OrbitMark size={14} active /> {account?.name ?? 'Claude'} está trabalhando…</div>
@@ -154,13 +253,45 @@ export function AgentSessionView({ session }: { session: Session }) {
         )}
       </div>
 
-      {session.pendingDenials.length > 0 && !live && <Denials session={session} />}
-      {!live && <Composer session={session} />}
+      {/* Numa sessão que foi para o terminal, as permissões pendentes não valem mais por aqui. Sem a conta, ou com o terminal
+          abrindo, só dá para concluir. */}
+      {session.pendingDenials.length > 0 && !live && !inTerminal && <Denials session={session} canContinue={Boolean(account) && !resuming} />}
+      {/* Conta removida: o servidor não continua a conversa. No lugar de uma caixa de resposta que não envia (e que buscaria a
+          configuração de uma conta que não existe mais), fica o aviso. */}
+      {!live && (account ? (
+        <Composer session={session} resuming={resuming} />
+      ) : (
+        <div className="composer">
+          <div className="composer-warning">
+            <AlertTriangle size={13} />
+            <span>
+              A conta desta sessão foi removida do Octo, então não dá para continuar esta conversa por aqui nem abri-la no terminal. Para
+              seguir com o trabalho, comece uma nova sessão com outra conta.
+            </span>
+          </div>
+        </div>
+      ))}
+
+      {askResume && (
+        <ConfirmDialog
+          title="Abrir outra janela do terminal?"
+          tone="primary"
+          confirmLabel="Abrir outra janela"
+          busyLabel="Abrindo…"
+          onConfirm={openInTerminal}
+          onClose={() => setAskResume(false)}
+        >
+          <p>Esta sessão já foi aberta no terminal. Se aquela janela ainda estiver aberta, continue por lá.</p>
+          <p>
+            Duas janelas na mesma conversa gravam o mesmo histórico ao mesmo tempo e o embaralham. Abra outra só se a primeira já foi fechada.
+          </p>
+        </ConfirmDialog>
+      )}
     </div>
   );
-}
+});
 
-function Feed({ activities, repoMap }: { activities: Activity[]; repoMap: Map<string, ReturnType<typeof useWorkspaceRepos>[number]> }) {
+function Feed({ activities, repoMap }: { activities: Activity[]; repoMap: RepoMap }) {
   const results = useMemo(() => {
     const map = new Map<string, Activity>();
     for (const a of activities) if (a.type === 'result' && a.toolUseId) map.set(a.toolUseId, a);
@@ -169,52 +300,63 @@ function Feed({ activities, repoMap }: { activities: Activity[]; repoMap: Map<st
 
   return (
     <>
-      {activities.map((activity) => {
-        switch (activity.type) {
-          case 'prompt':
-            return (
-              <div key={activity.id} className="act act-prompt">
-                <div className="act-who">Você</div>
-                <Markdown>{activity.text}</Markdown>
-                {activity.detail && <div className="act-note">{activity.detail}</div>}
-              </div>
-            );
-          case 'system':
-            return <div key={activity.id} className="act act-system">{activity.text}</div>;
-          case 'thought':
-            return <Collapsible key={activity.id} className="act act-thought" summary="Raciocínio">{activity.text}</Collapsible>;
-          case 'message':
-            return (
-              <div key={activity.id} className={`act act-message${activity.detail === 'subagente' ? ' is-nested' : ''}`}>
-                <Markdown>{activity.text}</Markdown>
-              </div>
-            );
-          case 'response':
-            return (
-              <div key={activity.id} className="act act-response">
-                <div className="act-who"><OrbitMark size={12} /> Resposta</div>
-                <Markdown>{activity.text}</Markdown>
-              </div>
-            );
-          case 'error':
-            return <div key={activity.id} className="act act-error"><AlertTriangle size={14} /> <span>{activity.text}</span></div>;
-          case 'action':
-            return <Action key={activity.id} activity={activity} result={activity.toolUseId ? results.get(activity.toolUseId) : undefined} repoMap={repoMap} />;
-          default:
-            return null; // resultados aparecem dentro da ação correspondente
-        }
-      })}
+      {activities.map((activity) =>
+        // Resultados aparecem dentro da ação correspondente.
+        activity.type === 'result' ? null : (
+          <ActivityItem key={activity.id} activity={activity} result={activity.toolUseId ? results.get(activity.toolUseId) : undefined} repoMap={repoMap} />
+        ),
+      )}
     </>
   );
 }
 
-function Action({ activity, result, repoMap }: { activity: Activity; result?: Activity; repoMap: Map<string, ReturnType<typeof useWorkspaceRepos>[number]> }) {
+/**
+ * Um item do feed. Uma atividade gravada não muda (só é trocada inteira), então a comparação por
+ * referência basta: a cada evento só o item novo renderiza, e o Markdown dos outros não é refeito.
+ */
+const ActivityItem = memo(function ActivityItem({ activity, result, repoMap }: { activity: Activity; result?: Activity; repoMap: RepoMap }) {
+  switch (activity.type) {
+    case 'prompt':
+      return (
+        <div className="act act-prompt">
+          <div className="act-who">Você</div>
+          <Markdown>{activity.text}</Markdown>
+          {activity.detail && <div className="act-note">{activity.detail}</div>}
+        </div>
+      );
+    case 'system':
+      return <div className="act act-system">{activity.text}</div>;
+    case 'thought':
+      return <Collapsible className="act act-thought" summary="Raciocínio">{activity.text}</Collapsible>;
+    case 'message':
+      return (
+        <div className={`act act-message${activity.detail === 'subagente' ? ' is-nested' : ''}`}>
+          <Markdown>{activity.text}</Markdown>
+        </div>
+      );
+    case 'response':
+      return (
+        <div className="act act-response">
+          <div className="act-who"><OrbitMark size={12} /> Resposta</div>
+          <Markdown>{activity.text}</Markdown>
+        </div>
+      );
+    case 'error':
+      return <div className="act act-error"><AlertTriangle size={14} /> <span>{activity.text}</span></div>;
+    case 'action':
+      return <Action activity={activity} result={result} repoMap={repoMap} />;
+    default:
+      return null;
+  }
+});
+
+function Action({ activity, result, repoMap }: { activity: Activity; result?: Activity; repoMap: RepoMap }) {
   const [open, setOpen] = useState(false);
   const Icon = TOOL_ICON[activity.tool ?? ''] ?? Wrench;
   const expandable = Boolean(activity.detail || result?.text);
   return (
     <div className={`act act-action${result?.isError ? ' is-error' : ''}${open ? ' is-open' : ''}`}>
-      <button className="act-action-row" onClick={() => expandable && setOpen((o) => !o)} disabled={!expandable}>
+      <button className="act-action-row" onClick={() => expandable && setOpen((o) => !o)} disabled={!expandable} aria-expanded={expandable ? open : undefined}>
         <Icon size={13} className="act-tool-icon" />
         <span className="act-action-text">{activity.text}</span>
         {(activity.repoIds ?? []).map((id) => repoMap.get(id)).filter(Boolean).map((repo) => <RepoChip key={repo!.id} repo={repo!} lit />)}
@@ -235,7 +377,7 @@ function Collapsible({ summary, children, className }: { summary: string; childr
   const [open, setOpen] = useState(false);
   return (
     <div className={className}>
-      <button className="act-collapse" onClick={() => setOpen((o) => !o)}>
+      <button className="act-collapse" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
         <ChevronRight size={12} style={{ transform: open ? 'rotate(90deg)' : undefined }} /> {summary}
       </button>
       {open && <div className="act-thought-body">{children}</div>}
@@ -244,8 +386,11 @@ function Collapsible({ summary, children, className }: { summary: string; childr
 }
 
 /** Equivalente à "elicitation" do Linear: o agente parou porque precisa de permissão. */
-function Denials({ session }: { session: Session }) {
-  const [chosen, setChosen] = useState(() => new Set(session.pendingDenials.map((d) => d.rule)));
+function Denials({ session, canContinue }: { session: Session; canContinue: boolean }) {
+  // O agente costuma repetir o mesmo comando negado: cada regra aparece uma vez só.
+  const rules = useMemo(() => [...new Set(session.pendingDenials.map((d) => d.rule))], [session.pendingDenials]);
+  const [chosen, setChosen] = useState(() => new Set(rules));
+  const [busy, setBusy] = useState(false);
   const toggle = (rule: string) =>
     setChosen((c) => {
       const next = new Set(c);
@@ -253,28 +398,39 @@ function Denials({ session }: { session: Session }) {
       else next.add(rule);
       return next;
     });
+  // Um clique só: o segundo cairia em "a sessão ainda está em execução".
+  const run = async (action: () => Promise<unknown>) => {
+    setBusy(true);
+    try {
+      await action();
+    } catch {
+      /* o aviso de erro já apareceu */
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <div className="denials">
       <div className="denials-head">
         <ShieldQuestion size={15} />
-        {session.pendingDenials.length === 1 ? 'Uma ação foi bloqueada' : `${session.pendingDenials.length} ações foram bloqueadas`} pelo modo de permissão
+        {rules.length === 1 ? 'Uma ação foi bloqueada' : `${rules.length} ações foram bloqueadas`} pelo modo de permissão
       </div>
       <p className="denials-help">Se o agente precisava disso para terminar, permita e ele continua de onde parou. Se ele já resolveu de outro jeito, conclua.</p>
-      {session.pendingDenials.map((d) => (
-        <label key={d.rule} className="denial">
-          <input type="checkbox" checked={chosen.has(d.rule)} onChange={() => toggle(d.rule)} />
-          <code>{d.rule}</code>
+      {rules.map((rule) => (
+        <label key={rule} className="denial">
+          <input type="checkbox" checked={chosen.has(rule)} onChange={() => toggle(rule)} disabled={busy} />
+          <code>{rule}</code>
         </label>
       ))}
       <div className="denials-actions">
         <button
           className="primary-btn"
-          disabled={!chosen.size}
-          onClick={() => api.message(session.id, 'Permissão concedida para as ações bloqueadas. Continue de onde parou.', [...chosen])}
+          disabled={!chosen.size || busy || !canContinue}
+          onClick={() => void run(() => api.message(session.id, 'Permissão concedida para as ações bloqueadas. Continue de onde parou.', [...chosen]))}
         >
-          Permitir e continuar
+          {busy ? 'Enviando…' : 'Permitir e continuar'}
         </button>
-        <button className="ghost-btn" onClick={() => api.dismissDenials(session.id)} title="Marca a sessão como concluída sem liberar as ações">
+        <button className="ghost-btn" disabled={busy} onClick={() => void run(() => api.dismissDenials(session.id))} title="Marca a sessão como concluída sem liberar as ações">
           Concluir assim mesmo
         </button>
       </div>
@@ -286,13 +442,22 @@ function Denials({ session }: { session: Session }) {
  * Resposta ao agente. Modelo, effort e permissões podem mudar a partir desta mensagem
  * (como /model e /effort no CLI), e "/" lista as skills e comandos da conta.
  */
-function Composer({ session }: { session: Session }) {
-  const [text, setText] = useState('');
+function Composer({ session, resuming }: { session: Session; resuming: boolean }) {
+  const [text, setTextState] = useState(() => composerDrafts.get(session.id) ?? '');
   const [changes, setChanges] = useState<Partial<SessionSettings>>({});
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
+  const [sending, setSending] = useState(false);
   const { config } = useAccountConfig(session.accountId, session.cwd);
+  const slashList = useRef<HTMLDivElement>(null);
   const current = { ...session, ...changes };
+  const listId = `slash-${session.id}`;
+
+  const setText = (next: string) => {
+    setTextState(next);
+    if (next) composerDrafts.set(session.id, next);
+    else composerDrafts.delete(session.id);
+  };
 
   const commands = useMemo(() => (config?.items ?? []).filter((item) => item.userInvocable), [config]);
   const typed = /^\/(\S*)$/.exec(text)?.[1].toLowerCase();
@@ -302,17 +467,34 @@ function Composer({ session }: { session: Session }) {
       : commands
           .filter((item) => item.name.toLowerCase().includes(typed))
           .sort((a, b) => Number(b.name.toLowerCase().startsWith(typed)) - Number(a.name.toLowerCase().startsWith(typed)) || a.name.localeCompare(b.name))
-          .slice(0, 8);
+          .slice(0, 50);
+  const active = matches.length ? slashIndex % matches.length : 0;
 
-  const send = async () => {
-    if (!text.trim()) return;
+  // O item destacado fica sempre à vista na lista, que rola quando há muitas skills.
+  useEffect(() => {
+    slashList.current?.querySelector<HTMLElement>('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' });
+  }, [active, matches.length]);
+
+  const deliver = async (message: string) => {
     const input: Partial<SettingsInput> = {};
     if ('model' in changes) input.model = changes.model ?? '';
     if ('effort' in changes) input.effort = changes.effort ?? '';
     if (changes.permissionMode) input.permissionMode = changes.permissionMode;
-    await api.message(session.id, text.trim(), [], input);
-    setText('');
-    setChanges({});
+    setSending(true);
+    setText(''); // limpa já; se o envio falhar, o texto volta
+    try {
+      await api.message(session.id, message, [], input);
+      setChanges({});
+    } catch {
+      setText(message);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const send = () => {
+    const message = text.trim();
+    if (message && !sending && !resuming) void deliver(message);
   };
 
   const pick = (name: string) => {
@@ -322,6 +504,17 @@ function Composer({ session }: { session: Session }) {
 
   return (
     <div className="composer">
+      {/* Em segundo plano, a conversa segue numa cópia (--fork-session): o terminal não vê o que acontecer aqui.
+          Vale também depois de "Marcar como concluída": a janela pode continuar aberta. */}
+      {session.mode === 'terminal' && (
+        <div className="composer-warning">
+          <AlertTriangle size={13} />
+          <span>
+            Continuar por aqui abre uma cópia desta conversa em segundo plano. Se o Claude ainda estiver aberto no terminal, ele segue com a
+            conversa original e não vê o que acontecer aqui.
+          </span>
+        </div>
+      )}
       <div className="composer-bar">
         <ModelPicker value={current.model} onChange={(model) => setChanges((c) => ({ ...c, model }))} accountDefault={setting(config, 'model')} />
         <EffortPicker compact value={current.effort} onChange={(effort) => setChanges((c) => ({ ...c, effort }))} accountDefault={setting(config, 'effortLevel')} />
@@ -330,12 +523,16 @@ function Composer({ session }: { session: Session }) {
       </div>
       <div className="composer-input">
         {matches.length > 0 && (
-          <div className="slash-menu" role="listbox">
+          <div className="slash-menu" role="listbox" id={listId} aria-label="Skills e comandos" ref={slashList}>
             {matches.map((item, index) => (
               <button
                 key={`${item.source}:${item.path}`}
+                id={`${listId}-${index}`}
                 type="button"
-                className={`slash-item${index === slashIndex % matches.length ? ' is-active' : ''}`}
+                role="option"
+                aria-selected={index === active}
+                tabIndex={-1}
+                className={`slash-item${index === active ? ' is-active' : ''}`}
                 onMouseEnter={() => setSlashIndex(index)}
                 onMouseDown={(e) => {
                   e.preventDefault(); // mantém o foco na caixa de texto
@@ -351,7 +548,12 @@ function Composer({ session }: { session: Session }) {
         )}
         <AutoTextarea
           minRows={2}
-          placeholder={session.state === 'terminal' ? 'Continuar esta sessão aqui, em segundo plano…' : 'Responder ao agente, pedir um ajuste ou usar uma /skill…'}
+          maxRows={10}
+          aria-label="Mensagem para o agente"
+          aria-autocomplete="list"
+          aria-controls={matches.length ? listId : undefined}
+          aria-activedescendant={matches.length ? `${listId}-${active}` : undefined}
+          placeholder={session.mode === 'terminal' ? 'Continuar esta sessão aqui, em segundo plano…' : 'Responder ao agente, pedir um ajuste ou usar uma /skill…'}
           value={text}
           onChange={(e) => {
             setText(e.target.value);
@@ -360,13 +562,12 @@ function Composer({ session }: { session: Session }) {
           }}
           onKeyDown={(e) => {
             if (matches.length) {
-              const active = slashIndex % matches.length;
               if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                 e.preventDefault();
                 setSlashIndex((active + (e.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length);
                 return;
               }
-              if (e.key === 'Tab' || (e.key === 'Enter' && !e.ctrlKey && !e.metaKey)) {
+              if (e.key === 'Tab' || (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.shiftKey)) {
                 e.preventDefault();
                 pick(matches[active].name);
                 return;
@@ -380,12 +581,12 @@ function Composer({ session }: { session: Session }) {
             }
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
               e.preventDefault();
-              void send();
+              send();
             }
           }}
         />
-        <button className="primary-btn" onClick={send} disabled={!text.trim()}>
-          Enviar <Kbd>Ctrl <CornerDownLeft size={10} /></Kbd>
+        <button className="primary-btn" onClick={send} disabled={!text.trim() || sending || resuming}>
+          {sending ? 'Enviando…' : <>Enviar <Kbd>{modKey()} <CornerDownLeft size={10} /></Kbd></>}
         </button>
       </div>
     </div>

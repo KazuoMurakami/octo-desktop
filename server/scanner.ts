@@ -2,42 +2,97 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Repo, Workspace } from '../shared/types.ts';
+import { baseEnv, gitPath, samePath } from './system.ts';
 
 const SKIP_DIRS = new Set([
-  'node_modules', 'dist', 'build', 'out', 'coverage', 'vendor', 'target', 'venv', '__pycache__', 'bin', 'obj',
+  'node_modules', 'dist', 'build', 'out', 'coverage', 'vendor', 'target', 'venv', '__pycache__', 'bin', 'obj', 'AppData',
 ]);
+/**
+ * Pastas do sistema na raiz do disco: enormes e sem repositórios (ex.: ao digitar C:\ ou /). Só as
+ * do sistema atual: num D:\ do Windows, pastas como dev ou lib costumam ser de projetos.
+ */
+const SYSTEM_ROOT_DIRS = new Set(
+  process.platform === 'win32'
+    ? ['Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 'System Volume Information', 'Recovery', 'PerfLogs']
+    : process.platform === 'darwin'
+      ? ['System', 'Library', 'private', 'usr', 'bin', 'sbin', 'dev', 'etc', 'var', 'cores']
+      : ['usr', 'bin', 'sbin', 'dev', 'proc', 'sys', 'etc', 'var', 'boot', 'lib', 'lib64', 'run', 'snap'],
+);
+/** Pastas da pasta pessoal com dados de apps e mídia, não projetos (o ~/Library do macOS tem milhares de pastas). */
+const HOME_SYSTEM_DIRS = new Set([
+  'Library', 'Applications', 'Pictures', 'Music', 'Movies', 'Videos', 'snap', 'Application Data', 'Local Settings', 'Saved Games',
+]);
+const HOME = homedir();
 
-/** Encontra pastas que são repositórios git abaixo da raiz, sem descer dentro de repos. */
-export async function findRepoDirs(root: string, maxDepth: number): Promise<string[]> {
+function skip(dir: string, name: string): boolean {
+  // "." = ocultas (.git, .cache…); "$" = pastas do Windows como $Recycle.Bin.
+  if (name.startsWith('.') || name.startsWith('$') || SKIP_DIRS.has(name)) return true;
+  if (path.parse(dir).root === dir && SYSTEM_ROOT_DIRS.has(name)) return true;
+  return HOME_SYSTEM_DIRS.has(name) && samePath(dir, HOME);
+}
+
+export interface FindLimits {
+  /** Máximo de pastas lidas; acima disso o resultado volta parcial. */
+  maxDirs?: number;
+  /** Interrompe a busca (ex.: a pessoa continuou digitando o caminho). */
+  signal?: AbortSignal;
+}
+
+/**
+ * Encontra pastas que são repositórios git abaixo da raiz, sem descer dentro de repos.
+ * `partial` indica que a busca parou no limite de pastas (ou foi cancelada).
+ */
+export async function findRepoDirs(root: string, maxDepth: number, limits: FindLimits = {}): Promise<{ dirs: string[]; partial: boolean }> {
+  const maxDirs = limits.maxDirs ?? 100_000;
   const found: string[] = [];
+  let visited = 0;
+  let partial = false;
   let level = [root];
-  for (let depth = 0; depth <= maxDepth && level.length > 0; depth++) {
+  for (let depth = 0; depth <= maxDepth && level.length > 0 && !partial; depth++) {
     const next: string[] = [];
-    await Promise.all(
-      level.map(async (dir) => {
+    let cursor = 0;
+    // Poucas leituras de pasta ao mesmo tempo: não enche a fila de E/S do servidor.
+    const worker = async () => {
+      while (cursor < level.length) {
+        if (limits.signal?.aborted || visited >= maxDirs) {
+          partial = true;
+          return;
+        }
+        const dir = level[cursor++];
+        visited++;
         const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
         const isRepo = entries.some((e) => e.name === '.git');
         if (isRepo) found.push(dir);
         // A raiz pode ser um repo e ainda conter outros repos independentes.
-        if (isRepo && dir !== root) return;
+        if (isRepo && dir !== root) continue;
         for (const entry of entries) {
-          if (!entry.isDirectory() || entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
-          next.push(path.join(dir, entry.name));
+          if (entry.isDirectory() && !skip(dir, entry.name)) next.push(path.join(dir, entry.name));
         }
-      }),
-    );
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(16, level.length) }, worker));
     level = next;
   }
-  return found.sort((a, b) => a.localeCompare(b));
+  return { dirs: found.sort((a, b) => a.localeCompare(b)), partial };
 }
 
 function git(cwd: string, args: string[], timeout = 8000): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile('git', args, { cwd, timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) =>
-      resolve(error ? null : stdout.toString()),
-    );
+    try {
+      execFile(
+        // Por caminho absoluto: com o nome solto, o Windows rodaria um git.exe de dentro do repositório.
+        gitPath(),
+        args,
+        // Sem o lock opcional do índice: o git status do Octo não disputa o .git/index.lock com o agente.
+        { cwd, timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024, env: { ...baseEnv(), GIT_OPTIONAL_LOCKS: '0' } },
+        (error, stdout) => resolve(error ? null : stdout.toString()),
+      );
+    } catch {
+      resolve(null); // git não encontrado
+    }
   });
 }
 
@@ -197,6 +252,11 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 }
 
 export async function scanWorkspace(workspace: Workspace): Promise<Repo[]> {
-  const dirs = await findRepoDirs(workspace.rootPath, workspace.scanDepth);
+  const { dirs } = await findRepoDirs(workspace.rootPath, workspace.scanDepth);
+  return describeRepos(workspace, dirs);
+}
+
+/** Lê de novo só estes repositórios (branch, alterações, último commit), sem varrer o workspace. */
+export function describeRepos(workspace: Workspace, dirs: string[]): Promise<Repo[]> {
   return mapLimit(dirs, 6, (dir) => describeRepo(workspace, dir));
 }

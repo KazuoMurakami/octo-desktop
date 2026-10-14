@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useState, useSyncExternalStore, type KeyboardEvent, type ReactNode } from 'react';
 import {
   Blocks, Bot, Braces, Copy, FolderOpen, Plug, Plus, Power, RefreshCw, Search, Server, SlidersHorizontal, Sparkles, SquareSlash, Trash2,
 } from 'lucide-react';
@@ -7,23 +7,26 @@ import { EFFORTS, type AccountConfig, type AvailablePlugin, type ClaudeAccount, 
 import { api } from '../api.ts';
 import { invalidateAccountConfig, setting, useAccountConfig } from '../claudeConfig.ts';
 import { defaultAccountId, toast, useStore } from '../store.ts';
+import { modKey } from '../util.ts';
+import { loginHint } from './AccountsView.tsx';
 import { AccountAvatar } from './icons.tsx';
+import { ConfirmDialog } from './modals.tsx';
 import { EffortPicker, ModelPicker } from './SessionSettings.tsx';
-import { Field, Menu, Modal } from './ui.tsx';
+import { Field, Kbd, Menu, Modal } from './ui.tsx';
 
 type Tab = 'general' | ClaudeItemKind | 'mcp' | 'plugins' | 'settings';
 
-const KIND: Record<ClaudeItemKind, { one: string; many: string; create: string; icon: typeof Sparkles; about: string }> = {
+const KIND: Record<ClaudeItemKind, { one: string; many: string; create: string; none: string; icon: typeof Sparkles; about: string }> = {
   skill: {
-    one: 'skill', many: 'Skills', create: 'Nova skill', icon: Sparkles,
+    one: 'skill', many: 'Skills', create: 'Nova skill', none: 'Nenhuma skill nesta conta ainda.', icon: Sparkles,
     about: 'Instruções e recursos que o Claude carrega quando a tarefa pede, ou quando você chama /nome. Ficam em skills/<nome>/SKILL.md.',
   },
   agent: {
-    one: 'agente', many: 'Agentes', create: 'Novo agente', icon: Bot,
+    one: 'agente', many: 'Agentes', create: 'Novo agente', none: 'Nenhum agente nesta conta ainda.', icon: Bot,
     about: 'Subagentes com prompt, ferramentas e modelo próprios. O Claude delega a eles, e você pode usar um como agente principal da sessão.',
   },
   command: {
-    one: 'comando', many: 'Comandos', create: 'Novo comando', icon: SquareSlash,
+    one: 'comando', many: 'Comandos', create: 'Novo comando', none: 'Nenhum comando nesta conta ainda.', icon: SquareSlash,
     about: 'Prompts prontos chamados com /nome. $ARGUMENTS recebe o que você digitar depois do comando.',
   },
 };
@@ -34,6 +37,76 @@ const TEMPLATE: Record<ClaudeItemKind, (name: string, description: string) => st
   command: (_name, description) => `---\ndescription: ${description}\n---\n\nFaça o seguinte com $ARGUMENTS:\n`,
 };
 
+// Exemplos que não levam a lugar nenhum se forem adicionados sem trocar: .example é um domínio
+// reservado (não existe) e um nome com maiúsculas não pode ser publicado no npm.
+const MCP_EXAMPLES: Record<string, string> = {
+  http: '{\n  "type": "http",\n  "url": "https://seu-servidor.example/mcp",\n  "headers": { "Authorization": "Bearer SEU_TOKEN" }\n}',
+  stdio: '{\n  "type": "stdio",\n  "command": "npx",\n  "args": ["-y", "NOME_DO_PACOTE"],\n  "env": { "API_KEY": "..." }\n}',
+};
+const EXAMPLE_JSONS = Object.values(MCP_EXAMPLES);
+
+// ---------------------------------------------------------------- rascunhos
+
+// Edições ainda não salvas do settings.json e do formulário de MCP, por conta. Ficam guardadas ao
+// trocar de aba, de conta ou de tela, até você salvar ou desfazer; a aba mostra um ponto enquanto houver.
+const drafts = new Map<string, string>();
+// O texto do arquivo quando o rascunho começou (só o do settings.json guarda). Se o arquivo mudar
+// depois (aba Geral, plugins, outro programa), salvar o rascunho desfaria essa mudança.
+const draftBases = new Map<string, string>();
+// O texto que você acabou de salvar, até a configuração recarregar com ele. Fica aqui, e não na aba: se você trocar
+// de aba antes da recarga, ao voltar o seu próprio salvar não parece uma mudança de fora.
+const savedTexts = new Map<string, string>();
+const draftListeners = new Set<() => void>();
+
+function setDraft(key: string, value: string | null, base?: string): void {
+  if (value === null) {
+    draftBases.delete(key);
+    if (!drafts.delete(key)) return;
+  } else {
+    if (drafts.get(key) === value) return;
+    // A base é a do começo da edição: as próximas mudanças no mesmo rascunho não a trocam.
+    if (base !== undefined && !drafts.has(key)) draftBases.set(key, base);
+    drafts.set(key, value);
+  }
+  for (const listener of draftListeners) listener();
+}
+
+/** Você salvou este texto (null: esquece). Até a configuração recarregar, o arquivo ainda aparece com o texto anterior. */
+function markSaved(key: string, text: string | null): void {
+  if (text === null ? !savedTexts.delete(key) : savedTexts.get(key) === text) return;
+  if (text !== null) savedTexts.set(key, text);
+  for (const listener of draftListeners) listener();
+}
+
+/** A configuração recarregou com o que você salvou: o que continuar no rascunho parte desse texto (não é mudança de fora). */
+function confirmSaved(key: string): void {
+  const text = savedTexts.get(key);
+  if (text === undefined) return;
+  savedTexts.delete(key);
+  if (drafts.has(key)) draftBases.set(key, text);
+  for (const listener of draftListeners) listener();
+}
+
+function subscribeDrafts(listener: () => void): () => void {
+  draftListeners.add(listener);
+  return () => void draftListeners.delete(listener);
+}
+
+function useDraft(key: string): string | undefined {
+  const read = () => drafts.get(key);
+  return useSyncExternalStore(subscribeDrafts, read, read);
+}
+
+function useDraftBase(key: string): string | undefined {
+  const read = () => draftBases.get(key);
+  return useSyncExternalStore(subscribeDrafts, read, read);
+}
+
+function useSavedText(key: string): string | undefined {
+  const read = () => savedTexts.get(key);
+  return useSyncExternalStore(subscribeDrafts, read, read);
+}
+
 /** Tudo o que o Claude Code de uma conta usa: os mesmos arquivos que o CLI lê. */
 export function ClaudeConfigView() {
   const { accounts, accountStatus, configAccountId, set } = useStore(
@@ -42,17 +115,20 @@ export function ClaudeConfigView() {
   const account = accounts.find((a) => a.id === configAccountId) ?? accounts.find((a) => a.id === defaultAccountId()) ?? accounts[0];
   const { config, loading } = useAccountConfig(account?.id);
   const [tab, setTab] = useState<Tab>('general');
+  const settingsDraft = useDraft(`settings:${account?.id}`);
+  const mcpName = useDraft(`mcp-name:${account?.id}`);
+  const mcpJson = useDraft(`mcp-json:${account?.id}`);
   if (!account) return null;
 
   const count = (kind: ClaudeItemKind) => config?.items.filter((i) => i.kind === kind).length;
-  const tabs: { id: Tab; label: string; icon: typeof Sparkles; count?: number }[] = [
+  const tabs: { id: Tab; label: string; icon: typeof Sparkles; count?: number; dirty?: boolean }[] = [
     { id: 'general', label: 'Geral', icon: SlidersHorizontal },
     { id: 'skill', label: 'Skills', icon: Sparkles, count: count('skill') },
     { id: 'agent', label: 'Agentes', icon: Bot, count: count('agent') },
     { id: 'command', label: 'Comandos', icon: SquareSlash, count: count('command') },
-    { id: 'mcp', label: 'MCP', icon: Server, count: config?.mcpServers.length },
+    { id: 'mcp', label: 'MCP', icon: Server, count: config?.mcpServers.length, dirty: Boolean(mcpName) || (mcpJson !== undefined && !EXAMPLE_JSONS.includes(mcpJson)) },
     { id: 'plugins', label: 'Plugins', icon: Plug, count: config?.plugins.length },
-    { id: 'settings', label: 'settings.json', icon: Braces },
+    { id: 'settings', label: 'settings.json', icon: Braces, dirty: settingsDraft !== undefined },
   ];
 
   return (
@@ -64,35 +140,43 @@ export function ClaudeConfigView() {
           width={280}
           trigger={<><AccountAvatar account={account} status={accountStatus[account.id]} size={16} /> {account.name}</>}
           items={accounts.map((a) => ({
-            key: a.id, label: a.name, hint: accountStatus[a.id]?.email ?? '', icon: <AccountAvatar account={a} size={16} />,
+            key: a.id, label: a.name, hint: loginHint(accountStatus[a.id]), icon: <AccountAvatar account={a} size={16} />,
             selected: a.id === account.id, onSelect: () => set({ configAccountId: a.id }),
           }))}
         />
         <span className="mono dim root-path" title={config?.configDir}>{config?.configDir}</span>
         <div className="view-tools">
-          <button className="ghost-btn" onClick={() => api.revealConfig(account.id)}><FolderOpen size={14} /> Abrir pasta</button>
+          <button className="ghost-btn" onClick={() => void api.revealConfig(account.id).catch(() => undefined)}><FolderOpen size={14} /> Abrir pasta</button>
           <button className="ghost-btn" onClick={() => invalidateAccountConfig(account.id, true)} disabled={loading}>
             <RefreshCw size={14} className={loading ? 'spin' : ''} /> Recarregar
           </button>
         </div>
       </header>
       <nav className="tabs">
-        {tabs.map(({ id, label, icon: Icon, count: n }) => (
+        {tabs.map(({ id, label, icon: Icon, count: n, dirty }) => (
           <button key={id} className={tab === id ? 'is-on' : ''} onClick={() => setTab(id)}>
             <Icon size={14} /> {label} {n !== undefined && <em>{n}</em>}
+            {dirty && <i className="tab-dirty" title="Alterações não salvas: ficam guardadas até você salvar ou desfazer" aria-label="alterações não salvas" />}
           </button>
         ))}
       </nav>
       <div className="config-body">
         {!config ? (
-          <div className="feed-loading">{loading ? 'Lendo a configuração…' : 'Não foi possível ler a configuração desta conta.'}</div>
+          <div className="feed-loading">
+            {loading ? 'Lendo a configuração…' : (
+              <>
+                Não foi possível ler a configuração desta conta.{' '}
+                <button className="link-btn" onClick={() => invalidateAccountConfig(account.id, true)}>Tentar de novo</button>
+              </>
+            )}
+          </div>
         ) : (
           <>
             {tab === 'general' && <GeneralTab account={account} config={config} goTo={setTab} />}
             {(tab === 'skill' || tab === 'agent' || tab === 'command') && <ItemsTab key={tab} kind={tab} account={account} config={config} accounts={accounts} />}
-            {tab === 'mcp' && <McpTab account={account} config={config} />}
+            {tab === 'mcp' && <McpTab key={account.id} account={account} config={config} />}
             {tab === 'plugins' && <PluginsTab account={account} config={config} />}
-            {tab === 'settings' && <SettingsTab key={account.id} account={account} config={config} />}
+            {tab === 'settings' && <SettingsTab key={account.id} account={account} config={config} loading={loading} />}
           </>
         )}
       </div>
@@ -197,7 +281,7 @@ function ItemsTab({ kind, account, config, accounts }: { kind: ClaudeItemKind; a
       <div className="config-toolbar">
         <label className="search">
           <Search size={14} />
-          <input placeholder={`Buscar ${meta.many.toLowerCase()}…`} value={query} onChange={(e) => setQuery(e.target.value)} />
+          <input placeholder={`Buscar ${meta.many.toLowerCase()}…`} aria-label={`Buscar ${meta.many.toLowerCase()}`} value={query} onChange={(e) => setQuery(e.target.value)} />
         </label>
         <button className="primary-btn" onClick={() => setCreating(true)}><Plus size={14} /> {meta.create}</button>
       </div>
@@ -216,7 +300,7 @@ function ItemsTab({ kind, account, config, accounts }: { kind: ClaudeItemKind; a
           ))}
         </div>
       ))}
-      {!groups.length && <div className="config-empty">{query ? 'Nada encontrado.' : `Nenhum ${meta.one} nesta conta ainda.`}</div>}
+      {!groups.length && <div className="config-empty">{query ? 'Nada encontrado.' : meta.none}</div>}
 
       {creating && (
         <NewItemModal
@@ -253,6 +337,7 @@ function NewItemModal({ kind, onClose, onCreate }: { kind: ClaudeItemKind; onClo
     <Modal
       title={KIND[kind].create}
       onClose={onClose}
+      dirty={Boolean(name.trim() || description.trim())}
       footer={<button className="primary-btn" onClick={submit} disabled={!slug || busy}>Criar e editar</button>}
     >
       <div className="stack-form" onKeyDown={(e) => e.key === 'Enter' && void submit()}>
@@ -272,6 +357,7 @@ function ItemEditor({ account, accounts, path, onClose }: { account: ClaudeAccou
   const [original, setOriginal] = useState('');
   const [content, setContent] = useState('');
   const [busy, setBusy] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
     api.readItem(account.id, path).then(({ item: loaded, content: text }) => {
@@ -284,13 +370,14 @@ function ItemEditor({ account, accounts, path, onClose }: { account: ClaudeAccou
   const readOnly = item?.source === 'plugin';
   const dirty = content !== original;
   const save = async () => {
+    if (!dirty || busy) return;
     setBusy(true);
     if (await act(account.id, () => api.saveItem(account.id, path, content), 'Salvo. Vale a partir das próximas sessões.')) setOriginal(content);
     setBusy(false);
   };
   const remove = async () => {
-    if (!item || !confirm(`Excluir "${item.name}"? O item vai para a lixeira do Octo (~/.octo/trash), de onde dá para recuperar.`)) return;
-    if (await act(account.id, () => api.deleteItem(account.id, path), 'Movido para a lixeira do Octo.')) onClose();
+    if (!(await act(account.id, () => api.deleteItem(account.id, path), 'Movido para a lixeira do Octo.'))) throw new Error('não excluído');
+    onClose();
   };
   const targets = accounts.filter((a) => readOnly || a.id !== account.id);
 
@@ -298,7 +385,8 @@ function ItemEditor({ account, accounts, path, onClose }: { account: ClaudeAccou
     <Modal
       width={860}
       title={<>{item ? <><span className="mono">{item.userInvocable ? '/' : ''}{item.name}</span> <span className="dim">· {KIND[item.kind].one}</span></> : 'Carregando…'}</>}
-      onClose={() => (!dirty || confirm('Descartar as alterações?')) && onClose()}
+      onClose={onClose}
+      dirty={dirty}
       footer={
         <>
           <span className="foot-hint mono dim" title={path}>{path}</span>
@@ -313,18 +401,78 @@ function ItemEditor({ account, accounts, path, onClose }: { account: ClaudeAccou
               }))}
             />
           )}
-          {!readOnly && <button className="ghost-btn is-danger" onClick={remove}><Trash2 size={13} /> Excluir</button>}
-          {!readOnly && <button className="primary-btn" onClick={save} disabled={!dirty || busy}>Salvar</button>}
+          {!readOnly && <button className="ghost-btn is-danger" onClick={() => setConfirmDelete(true)} disabled={!item}><Trash2 size={13} /> Excluir</button>}
+          {!readOnly && (
+            <button className="primary-btn" onClick={save} disabled={!dirty || busy} title={`Salvar (${modKey()}+S)`}>
+              Salvar <Kbd>{modKey()} S</Kbd>
+            </button>
+          )}
         </>
       }
     >
       {readOnly && <div className="config-note">Vem do plugin <code>{item?.plugin}</code> e é somente leitura. Copie para uma conta para personalizar.</div>}
       <CodeEditor value={content} onChange={setContent} readOnly={readOnly} onSave={save} />
+
+      {confirmDelete && item && (
+        <ConfirmDialog
+          title={`Excluir "${item.name}"?`}
+          confirmLabel={`Excluir ${KIND[item.kind].one}`}
+          busyLabel="Excluindo…"
+          onConfirm={remove}
+          onClose={() => setConfirmDelete(false)}
+        >
+          <p>
+            {item.kind === 'skill' ? 'A skill deixa' : item.kind === 'agent' ? 'O agente deixa' : 'O comando deixa'} de existir para a conta{' '}
+            <strong>{account.name}</strong> a partir das próximas sessões{item.userInvocable ? <>, e <code>/{item.name}</code> para de funcionar</> : ''}.
+          </p>
+          <p>
+            O arquivo vai para a lixeira do Octo (<span className="mono">~/.octo/trash</span>), de onde dá para recuperar.
+            {dirty && ' As alterações que você não salvou se perdem.'}
+          </p>
+        </ConfirmDialog>
+      )}
     </Modal>
   );
 }
 
-/** Textarea para Markdown/JSON: Tab indenta, Ctrl+S salva. */
+/** Troca um trecho do texto mantendo o desfazer (Ctrl+Z) do navegador; devolve false se não deu. */
+function replaceText(el: HTMLTextAreaElement, from: number, to: number, text: string): boolean {
+  el.setSelectionRange(from, to);
+  return document.execCommand('insertText', false, text);
+}
+
+/** Tab indenta a linha (ou as linhas selecionadas) com dois espaços; Shift+Tab desindenta. */
+function shiftLines(el: HTMLTextAreaElement, outdent: boolean, onChange: (value: string) => void): void {
+  const { value, selectionStart: start, selectionEnd: end } = el;
+  const multiline = value.slice(start, end).includes('\n');
+  let from = start;
+  let to = end;
+  let text = '  ';
+  let select: [number, number] = [start + 2, start + 2];
+  if (outdent || multiline) {
+    from = value.lastIndexOf('\n', start - 1) + 1;
+    // Uma seleção que termina no começo de uma linha não inclui essa linha.
+    const last = end > start && value[end - 1] === '\n' ? end - 1 : end;
+    const lineEnd = value.indexOf('\n', last);
+    to = lineEnd === -1 ? value.length : lineEnd;
+    const block = value.slice(from, to);
+    text = outdent ? block.replace(/^(?: {1,2}|\t)/gm, '') : block.replace(/^/gm, '  ');
+    if (text === block) return;
+    const caret = Math.max(from, start - (block.length - text.length));
+    select = multiline ? [from, from + text.length] : [caret, caret];
+  }
+  if (replaceText(el, from, to, text)) {
+    el.setSelectionRange(...select);
+  } else {
+    onChange(value.slice(0, from) + text + value.slice(to));
+    requestAnimationFrame(() => el.setSelectionRange(...select));
+  }
+}
+
+/**
+ * Textarea para Markdown/JSON: Tab indenta, Shift+Tab desindenta e Ctrl/⌘+S salva. Para o teclado
+ * não ficar preso aqui, Esc tira o foco do editor e o Tab seguinte vai para o próximo campo.
+ */
 function CodeEditor({ value, onChange, readOnly = false, onSave, rows = 22 }: {
   value: string;
   onChange: (value: string) => void;
@@ -332,38 +480,64 @@ function CodeEditor({ value, onChange, readOnly = false, onSave, rows = 22 }: {
   onSave?: () => void;
   rows?: number;
 }) {
+  const hintId = useId();
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    const el = e.currentTarget;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
       onSave?.();
-    } else if (e.key === 'Tab' && !readOnly) {
+    } else if (e.key === 'Escape') {
+      el.blur();
+    } else if (e.key === 'Tab' && !readOnly && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
-      const el = e.currentTarget;
-      const { selectionStart: start, selectionEnd: end } = el;
-      onChange(`${value.slice(0, start)}  ${value.slice(end)}`);
-      requestAnimationFrame(() => el.setSelectionRange(start + 2, start + 2));
+      shiftLines(el, e.shiftKey, onChange);
     }
   };
-  return <textarea className="code-editor" spellCheck={false} rows={rows} value={value} readOnly={readOnly} onChange={(e) => onChange(e.target.value)} onKeyDown={onKeyDown} />;
+  return (
+    <div className="code-editor-wrap">
+      <textarea
+        className="code-editor"
+        spellCheck={false}
+        rows={rows}
+        value={value}
+        readOnly={readOnly}
+        aria-describedby={readOnly ? undefined : hintId}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={onKeyDown}
+      />
+      {!readOnly && (
+        <span className="code-editor-hint" id={hintId}>
+          <Kbd>Tab</Kbd> indenta · <Kbd>Shift Tab</Kbd> desindenta · <Kbd>Esc</Kbd> e depois <Kbd>Tab</Kbd> saem do editor
+          {onSave && <> · <Kbd>{modKey()} S</Kbd> salva</>}
+        </span>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------- MCP
 
-const MCP_EXAMPLES: Record<string, string> = {
-  http: '{\n  "type": "http",\n  "url": "https://exemplo.com/mcp",\n  "headers": { "Authorization": "Bearer SEU_TOKEN" }\n}',
-  stdio: '{\n  "type": "stdio",\n  "command": "npx",\n  "args": ["-y", "pacote-do-servidor"],\n  "env": { "API_KEY": "..." }\n}',
-};
-
 function McpTab({ account, config }: { account: ClaudeAccount; config: AccountConfig }) {
-  const [name, setName] = useState('');
-  const [json, setJson] = useState(MCP_EXAMPLES.http);
+  const nameKey = `mcp-name:${account.id}`;
+  const jsonKey = `mcp-json:${account.id}`;
+  const name = useDraft(nameKey) ?? '';
+  const json = useDraft(jsonKey) ?? MCP_EXAMPLES.http;
+  const setName = (value: string) => setDraft(nameKey, value || null);
+  const setJson = (value: string) => setDraft(jsonKey, value === MCP_EXAMPLES.http ? null : value);
+  // O exemplo não é a configuração de ninguém: adicioná-lo daria a toda sessão da conta um servidor que não existe.
+  const isExample = EXAMPLE_JSONS.includes(json);
   const [busy, setBusy] = useState(false);
+  const [removing, setRemoving] = useState<string | null>(null);
   const user = config.mcpServers.filter((s) => s.scope === 'user');
   const fromPlugins = config.mcpServers.filter((s) => s.scope === 'plugin');
 
   const add = async () => {
     setBusy(true);
-    if (await act(account.id, () => api.addMcp(account.id, name.trim(), json), `Servidor ${name.trim()} adicionado.`)) setName('');
+    if (await act(account.id, () => api.addMcp(account.id, name.trim(), json), `Servidor ${name.trim()} adicionado.`)) {
+      // O JSON pode ter tokens: depois de adicionar, o formulário volta ao exemplo.
+      setDraft(nameKey, null);
+      setDraft(jsonKey, null);
+    }
     setBusy(false);
   };
 
@@ -381,11 +555,7 @@ function McpTab({ account, config }: { account: ClaudeAccount; config: AccountCo
             <span className="item-desc mono">{server.target}</span>
             <span className="item-tags">
               <span className="tag">{server.type}</span>
-              <button
-                className="icon-btn is-danger"
-                title="Remover"
-                onClick={() => confirm(`Remover o servidor MCP "${server.name}"?`) && void act(account.id, () => api.removeMcp(account.id, server.name), 'Servidor removido.')}
-              >
+              <button className="icon-btn is-danger" title="Remover" aria-label={`Remover o servidor ${server.name}`} onClick={() => setRemoving(server.name)}>
                 <Trash2 size={14} />
               </button>
             </span>
@@ -423,8 +593,29 @@ function McpTab({ account, config }: { account: ClaudeAccount; config: AccountCo
         <Field label="Configuração (JSON)" hint={<>Igual a <code>claude mcp add-json</code>. Tokens ficam só no arquivo de configuração da conta.</>}>
           <CodeEditor value={json} onChange={setJson} rows={8} />
         </Field>
-        <div><button className="primary-btn" onClick={add} disabled={!name.trim() || busy}><Plus size={14} /> Adicionar</button></div>
+        <div className="config-toolbar">
+          <button className="primary-btn" onClick={add} disabled={!name.trim() || isExample || busy}><Plus size={14} /> Adicionar</button>
+          {isExample && <span className="dim">Troque o exemplo pela configuração do seu servidor para adicionar.</span>}
+        </div>
       </div>
+
+      {removing && (
+        <ConfirmDialog
+          title={`Remover o servidor MCP "${removing}"?`}
+          confirmLabel="Remover servidor"
+          busyLabel="Removendo…"
+          onConfirm={async () => {
+            if (!(await act(account.id, () => api.removeMcp(account.id, removing), 'Servidor removido.'))) throw new Error('não removido');
+          }}
+          onClose={() => setRemoving(null)}
+        >
+          <p>O Claude da conta <strong>{account.name}</strong> perde as ferramentas desse servidor em todas as pastas, a partir das próximas sessões.</p>
+          <p>
+            A configuração dele é apagada do arquivo da conta, <strong>inclusive tokens e chaves em env e headers</strong> (que o Octo não mostra).
+            Para usar de novo, será preciso adicioná-lo com a configuração completa.
+          </p>
+        </ConfirmDialog>
+      )}
     </div>
   );
 }
@@ -436,17 +627,21 @@ function PluginsTab({ account, config }: { account: ClaudeAccount; config: Accou
   const [available, setAvailable] = useState<AvailablePlugin[] | null>(null);
   const [loadingAvailable, setLoadingAvailable] = useState(false);
   const [query, setQuery] = useState('');
+  const [uninstalling, setUninstalling] = useState<string | null>(null);
   const installed = useMemo(() => new Set(config.plugins.map((p) => p.id)), [config.plugins]);
 
-  const run = async (action: 'install' | 'uninstall' | 'enable' | 'disable', id: string, message: string) => {
+  const run = async (action: 'install' | 'uninstall' | 'enable' | 'disable', id: string, message: string): Promise<boolean> => {
     setBusy(id);
-    await act(account.id, () => api.pluginAction(account.id, action, id), message);
+    const ok = await act(account.id, () => api.pluginAction(account.id, action, id), message);
     setBusy(null);
+    return ok;
   };
   const loadAvailable = async () => {
     setLoadingAvailable(true);
     try {
       setAvailable(await api.availablePlugins(account.id));
+    } catch {
+      /* o aviso de erro já apareceu */
     } finally {
       setLoadingAvailable(false);
     }
@@ -473,18 +668,21 @@ function PluginsTab({ account, config }: { account: ClaudeAccount; config: Accou
               {plugin.mcpServers.length > 0 && <span className="dim"> · MCP: {plugin.mcpServers.join(', ')}</span>}
             </span>
             <span className="item-tags">
+              {/* O selo diz o estado; o botão diz o que acontece ao clicar. */}
+              <span className={`tag${plugin.enabled ? ' is-on' : ''}`}>{plugin.enabled ? 'ativo' : 'desativado'}</span>
               <button
-                className={`ghost-btn is-small${plugin.enabled ? '' : ' is-muted'}`}
+                className="ghost-btn is-small"
                 disabled={busy === plugin.id}
-                onClick={() => run(plugin.enabled ? 'disable' : 'enable', plugin.id, plugin.enabled ? 'Plugin desativado.' : 'Plugin ativado.')}
+                onClick={() => void run(plugin.enabled ? 'disable' : 'enable', plugin.id, plugin.enabled ? 'Plugin desativado.' : 'Plugin ativado.')}
               >
-                <Power size={13} /> {plugin.enabled ? 'Ativo' : 'Desativado'}
+                <Power size={13} /> {plugin.enabled ? 'Desativar' : 'Ativar'}
               </button>
               <button
                 className="icon-btn is-danger"
                 title="Desinstalar"
+                aria-label={`Desinstalar ${plugin.id.split('@')[0]}`}
                 disabled={busy === plugin.id}
-                onClick={() => confirm(`Desinstalar ${plugin.id}?`) && void run('uninstall', plugin.id, 'Plugin desinstalado.')}
+                onClick={() => setUninstalling(plugin.id)}
               >
                 <Trash2 size={14} />
               </button>
@@ -503,7 +701,7 @@ function PluginsTab({ account, config }: { account: ClaudeAccount; config: Accou
         <>
           <label className="search">
             <Search size={14} />
-            <input autoFocus placeholder={`Buscar entre ${available.length} plugins…`} value={query} onChange={(e) => setQuery(e.target.value)} />
+            <input autoFocus placeholder={`Buscar entre ${available.length} plugins…`} aria-label="Buscar plugins" value={query} onChange={(e) => setQuery(e.target.value)} />
           </label>
           <div className="item-group">
             {shown.map((plugin) => (
@@ -515,7 +713,7 @@ function PluginsTab({ account, config }: { account: ClaudeAccount; config: Accou
                   {installed.has(plugin.id) ? (
                     <span className="tag is-claude">instalado</span>
                   ) : (
-                    <button className="ghost-btn is-small" disabled={busy === plugin.id} onClick={() => run('install', plugin.id, `${plugin.name} instalado.`)}>
+                    <button className="ghost-btn is-small" disabled={busy === plugin.id} onClick={() => void run('install', plugin.id, `${plugin.name} instalado.`)}>
                       {busy === plugin.id ? <RefreshCw size={13} className="spin" /> : <Plus size={13} />} Instalar
                     </button>
                   )}
@@ -526,23 +724,59 @@ function PluginsTab({ account, config }: { account: ClaudeAccount; config: Accou
           </div>
         </>
       )}
+
+      {uninstalling && (
+        <ConfirmDialog
+          title={`Desinstalar ${uninstalling.split('@')[0]}?`}
+          confirmLabel="Desinstalar"
+          busyLabel="Desinstalando…"
+          onConfirm={async () => {
+            if (!(await run('uninstall', uninstalling, 'Plugin desinstalado.'))) throw new Error('não desinstalado');
+          }}
+          onClose={() => setUninstalling(null)}
+        >
+          <p>
+            As skills, agentes, comandos, hooks e servidores MCP que vêm dele deixam de funcionar na conta <strong>{account.name}</strong> a partir
+            das próximas sessões.
+          </p>
+          <p>Dá para instalar de novo depois, pela lista de plugins disponíveis. Se você só quer pausar o plugin, use “Desativar”.</p>
+        </ConfirmDialog>
+      )}
     </div>
   );
 }
 
 // ---------------------------------------------------------------- settings.json
 
-function SettingsTab({ account, config }: { account: ClaudeAccount; config: AccountConfig }) {
+function SettingsTab({ account, config, loading }: { account: ClaudeAccount; config: AccountConfig; loading: boolean }) {
   const original = config.settingsRaw || '{\n}\n';
-  const [raw, setRaw] = useState(original);
-  const [base, setBase] = useState(original);
+  const key = `settings:${account.id}`;
+  const draft = useDraft(key);
+  const base = useDraftBase(key);
+  const savedText = useSavedText(key);
+  // Sem rascunho, o editor acompanha o arquivo (mudanças pela aba Geral ou por fora aparecem na hora).
+  const raw = draft ?? original;
+  // A base é o texto real do arquivo ('' se ele não existe), não o "{ }" que o editor mostra no lugar.
+  const setRaw = (next: string) => setDraft(key, next === original ? null : next, config.settingsRaw);
+  // Descartar recomeça a edição do zero, a partir do arquivo atual.
+  const discard = () => {
+    markSaved(key, null);
+    setDraft(key, null);
+  };
   const [busy, setBusy] = useState(false);
+  // O arquivo mudou depois que você começou a editar: salvar o rascunho desfaria essa mudança sem ninguém perceber.
+  // O texto que você mesmo salvou não conta: o que você digitar enquanto a configuração recarrega continua valendo.
+  const stale = draft !== undefined && draft !== original && base !== undefined && base !== config.settingsRaw && config.settingsRaw !== savedText;
 
-  // O arquivo mudou (pela aba Geral ou por fora): acompanha, a menos que haja edição sua pendente.
-  if (base !== original) {
-    if (raw === base) setRaw(original);
-    setBase(original);
-  }
+  // O arquivo ficou igual ao rascunho (você salvou, ou alguém fez a mesma mudança): não há mais o que guardar.
+  useEffect(() => {
+    if (draft !== undefined && draft === original) setDraft(key, null);
+  }, [draft, original, key]);
+
+  // A configuração recarregou com o que você salvou: o rascunho que continuou passa a partir desse texto.
+  useEffect(() => {
+    if (savedText !== undefined && config.settingsRaw === savedText) confirmSaved(key);
+  }, [config.settingsRaw, savedText, key]);
 
   const error = useMemo(() => {
     try {
@@ -553,12 +787,24 @@ function SettingsTab({ account, config }: { account: ClaudeAccount; config: Acco
     }
   }, [raw]);
 
+  // Enquanto a configuração recarrega (logo depois de uma mudança pela aba Geral ou por um plugin, por exemplo), o
+  // arquivo pode já ter mudado sem aparecer aqui: o Salvar espera a leitura terminar.
   const save = async () => {
-    if (error || raw === original) return;
+    if (error || raw === original || stale || loading || busy) return;
     setBusy(true);
-    await act(account.id, () => api.saveSettingsRaw(account.id, raw), 'settings.json salvo. A versão anterior ficou em ~/.octo/backups.');
+    if (await act(account.id, () => api.saveSettingsRaw(account.id, raw), 'settings.json salvo. A versão anterior ficou em ~/.octo/backups.')) markSaved(key, raw);
     setBusy(false);
   };
+
+  const state = stale
+    ? 'O arquivo mudou depois que você começou a editar.'
+    : error
+      ? `JSON inválido: ${error}`
+      : raw === original
+        ? 'Sem alterações.'
+        : raw === savedText
+          ? 'Salvo.'
+          : 'Alterações não salvas. Elas ficam guardadas se você trocar de aba ou de conta.';
 
   return (
     <div className="config-pane is-wide">
@@ -567,12 +813,21 @@ function SettingsTab({ account, config }: { account: ClaudeAccount; config: Acco
         <code>modelSettings</code>, <code>statusLine</code>, <code>enabledPlugins</code> e o resto.{' '}
         <a href="https://docs.claude.com/en/docs/claude-code/settings" target="_blank" rel="noreferrer">Referência das configurações</a>
       </p>
-      <CodeEditor value={raw} onChange={setRaw} onSave={save} rows={26} />
+      {stale && (
+        <div className="config-warning">
+          O settings.json mudou depois que você começou a editar (pela aba Geral, por um plugin ou fora do Octo). Salvar este rascunho
+          desfaria essa mudança, por isso o Salvar fica bloqueado. Copie o que quiser manter e{' '}
+          <button className="link-btn" onClick={discard}>descarte o rascunho</button> para editar a versão atual do arquivo.
+        </div>
+      )}
+      <CodeEditor value={raw} onChange={setRaw} onSave={() => void save()} rows={26} />
       <div className="config-toolbar">
-        <span className={error ? 'is-error' : 'dim'}>{error ? `JSON inválido: ${error}` : raw === original ? 'Sem alterações.' : 'Alterações não salvas.'}</span>
+        <span className={error || stale ? 'is-error' : 'dim'}>{state}</span>
         <div className="view-tools">
-          <button className="ghost-btn" onClick={() => setRaw(original)} disabled={raw === original}>Desfazer</button>
-          <button className="primary-btn" onClick={save} disabled={Boolean(error) || raw === original || busy}>Salvar</button>
+          <button className="ghost-btn" onClick={discard} disabled={raw === original}>Desfazer</button>
+          <button className="primary-btn" onClick={() => void save()} disabled={Boolean(error) || raw === original || stale || loading || busy} title={`Salvar (${modKey()}+S)`}>
+            Salvar <Kbd>{modKey()} S</Kbd>
+          </button>
         </div>
       </div>
       <p className="dim config-foot">

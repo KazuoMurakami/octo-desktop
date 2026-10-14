@@ -15,10 +15,17 @@ export type Modal =
   | { kind: 'preferences' }
   | { kind: 'changes'; dir: string; title: string };
 
+/** Botão opcional de um aviso (ex.: "Ver" ou "Ativar avisos"). */
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 export interface Toast {
   id: number;
   text: string;
   tone: 'info' | 'error' | 'success';
+  action?: ToastAction;
 }
 
 interface Store {
@@ -34,6 +41,7 @@ interface Store {
   sessions: AgentSession[];
   preferences: Preferences;
   meta: AppMeta | null;
+  /** Atividades das sessões abertas no painel; saem da memória quando o painel fecha. */
   activities: Record<string, Activity[]>;
 
   workspaceId: string | null;
@@ -47,6 +55,10 @@ interface Store {
   configAccountId: string | null;
   modal: Modal | null;
   paletteOpen: boolean;
+  /** Janela estreita: a navegação vira uma gaveta aberta pela barra do topo. */
+  navOpen: boolean;
+  /** Lista de atalhos de teclado (tecla ?). */
+  shortcutsOpen: boolean;
   toasts: Toast[];
 
   hydrate(state: AppState): void;
@@ -81,6 +93,25 @@ function upsert<T extends { id: string }>(list: T[], item: T): T[] {
   return next;
 }
 
+/**
+ * O snapshot do servidor substitui a lista; só fica a versão local de um item quando ela é
+ * mais nova (um evento que chegou por SSE enquanto o snapshot estava a caminho).
+ */
+function newest<T extends { id: string; updatedAt: string }>(fresh: T[], local: T[]): T[] {
+  const mine = new Map(local.map((x) => [x.id, x]));
+  return fresh.map((x) => {
+    const current = mine.get(x.id);
+    return current && current.updatedAt > x.updatedAt ? current : x;
+  });
+}
+
+/**
+ * Ids das atividades que já estavam na tela quando a conexão com o servidor caiu. Na
+ * ressincronização, vale a versão do servidor para elas (a última mensagem, por exemplo,
+ * pode ter virado "resposta" durante a queda).
+ */
+const staleActivities = new Map<string, Set<string>>();
+
 export const useStore = create<Store>((set, get) => ({
   loaded: false,
   connected: false,
@@ -105,12 +136,36 @@ export const useStore = create<Store>((set, get) => ({
   configAccountId: null,
   modal: null,
   paletteOpen: false,
+  navOpen: false,
+  shortcutsOpen: false,
   toasts: [],
 
   hydrate(state) {
-    const current = get().workspaceId;
-    const workspaceId = state.workspaces.some((w) => w.id === current) ? current : (state.workspaces[0]?.id ?? null);
-    set({ ...state, loaded: true, workspaceId });
+    const s = get();
+    const workspaceId = state.workspaces.some((w) => w.id === s.workspaceId) ? s.workspaceId : (state.workspaces[0]?.id ?? null);
+    const sessions = newest(state.sessions, s.sessions);
+    const issues = newest(state.issues, s.issues);
+    const accountStatus = { ...state.accountStatus };
+    for (const [id, local] of Object.entries(s.accountStatus)) {
+      const fresh = accountStatus[id];
+      if (state.accounts.some((a) => a.id === id) && (!fresh || local.checkedAt > fresh.checkedAt)) accountStatus[id] = local;
+    }
+    // Atividades de sessões que deixaram de existir saem da memória (e não são buscadas de novo).
+    const alive = new Set(sessions.map((x) => x.id));
+    const activities = Object.fromEntries(Object.entries(s.activities).filter(([id]) => alive.has(id)));
+    for (const id of staleActivities.keys()) if (!alive.has(id)) staleActivities.delete(id);
+    set({
+      ...state,
+      sessions,
+      issues,
+      accountStatus,
+      activities,
+      loaded: true,
+      workspaceId,
+      openIssueId: issues.some((i) => i.id === s.openIssueId) ? s.openIssueId : null,
+      openSessionId: s.openSessionId && alive.has(s.openSessionId) ? s.openSessionId : null,
+      repoFilter: state.repos.some((r) => r.id === s.repoFilter) ? s.repoFilter : null,
+    });
   },
 
   apply(event) {
@@ -121,12 +176,19 @@ export const useStore = create<Store>((set, get) => ({
         break;
       case 'workspace.deleted': {
         const workspaces = s.workspaces.filter((w) => w.id !== event.id);
+        const sessions = s.sessions.filter((x) => x.workspaceId !== event.id);
+        const issues = s.issues.filter((i) => i.workspaceId !== event.id);
+        const alive = new Set(sessions.map((x) => x.id));
+        for (const id of staleActivities.keys()) if (!alive.has(id)) staleActivities.delete(id);
         set({
           workspaces,
           workspaceId: s.workspaceId === event.id ? (workspaces[0]?.id ?? null) : s.workspaceId,
           repos: s.repos.filter((r) => r.workspaceId !== event.id),
-          issues: s.issues.filter((i) => i.workspaceId !== event.id),
-          sessions: s.sessions.filter((x) => x.workspaceId !== event.id),
+          issues,
+          sessions,
+          activities: Object.fromEntries(Object.entries(s.activities).filter(([id]) => alive.has(id))),
+          openIssueId: issues.some((i) => i.id === s.openIssueId) ? s.openIssueId : null,
+          openSessionId: s.openSessionId && alive.has(s.openSessionId) ? s.openSessionId : null,
         });
         break;
       }
@@ -137,7 +199,12 @@ export const useStore = create<Store>((set, get) => ({
         set({ accounts: upsert(s.accounts, event.account) });
         break;
       case 'account.deleted':
-        set({ accounts: s.accounts.filter((a) => a.id !== event.id) });
+        // Os workspaces que tinham essa conta como padrão chegam à parte, com a conta que o servidor escolheu.
+        set({
+          accounts: s.accounts.filter((a) => a.id !== event.id),
+          accountStatus: Object.fromEntries(Object.entries(s.accountStatus).filter(([id]) => id !== event.id)),
+          configAccountId: s.configAccountId === event.id ? null : s.configAccountId,
+        });
         break;
       case 'account.status':
         set({ accountStatus: { ...s.accountStatus, [event.status.accountId]: event.status } });
@@ -157,6 +224,7 @@ export const useStore = create<Store>((set, get) => ({
       case 'activity': {
         const list = s.activities[event.activity.sessionId];
         if (!list) break; // só acompanhamos sessões já abertas na interface
+        staleActivities.get(event.activity.sessionId)?.delete(event.activity.id);
         set({ activities: { ...s.activities, [event.activity.sessionId]: upsert(list, event.activity) } });
         break;
       }
@@ -164,20 +232,28 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   setActivities(sessionId, activities) {
+    staleActivities.delete(sessionId);
     set({ activities: { ...get().activities, [sessionId]: activities } });
   },
 
-  /** Junta um snapshot do servidor com eventos que chegaram por SSE enquanto ele carregava. */
+  /**
+   * Junta o que veio do servidor com o que chegou por SSE durante a busca (que é mais novo).
+   * O que já estava na tela antes de uma queda da conexão não vale mais que o servidor.
+   */
   mergeActivities(sessionId, fetched) {
+    const current = get().activities[sessionId];
+    if (!current) return; // o painel fechou enquanto a busca acontecia
+    const stale = staleActivities.get(sessionId);
+    staleActivities.delete(sessionId);
     const byId = new Map(fetched.map((a) => [a.id, a]));
-    for (const live of get().activities[sessionId] ?? []) byId.set(live.id, live);
+    for (const live of current) if (!stale?.has(live.id)) byId.set(live.id, live);
     const merged = [...byId.values()].sort((a, b) => a.ts.localeCompare(b.ts));
     set({ activities: { ...get().activities, [sessionId]: merged } });
   },
 
   selectWorkspace(id) {
     remember('workspace', id);
-    set({ workspaceId: id, repoFilter: null, openIssueId: null, openSessionId: null });
+    set({ workspaceId: id, repoFilter: null, search: '', openIssueId: null, openSessionId: null });
   },
 
   set(partial) {
@@ -187,11 +263,79 @@ export const useStore = create<Store>((set, get) => ({
   },
 }));
 
+useStore.subscribe((state, prev) => {
+  // A conexão caiu: o que está na tela pode ter mudado no servidor sem chegar aqui.
+  if (prev.connected && !state.connected) {
+    for (const [sessionId, list] of Object.entries(state.activities)) {
+      const ids = staleActivities.get(sessionId) ?? new Set<string>();
+      for (const activity of list) ids.add(activity.id);
+      staleActivities.set(sessionId, ids);
+    }
+  }
+  // O painel fechou: as atividades saem da memória (reabrir busca de novo, e uma reconexão
+  // não baixa outra vez o histórico de toda sessão já aberta).
+  const wasOpen = Boolean(prev.openIssueId || prev.openSessionId);
+  if (wasOpen && !state.openIssueId && !state.openSessionId && Object.keys(state.activities).length) {
+    staleActivities.clear();
+    useStore.setState({ activities: {} });
+  }
+});
+
+// ---------------------------------------------------------------- avisos (toasts)
+
+const TOAST_MS: Record<Toast['tone'], number> = { info: 4500, success: 3500, error: 8000 };
+const MAX_TOASTS = 4;
+
+interface ToastTimer {
+  handle: ReturnType<typeof setTimeout> | null;
+  remaining: number;
+  started: number;
+}
+const timers = new Map<number, ToastTimer>();
+/** Motivos para segurar os avisos na tela: mouse ou foco sobre eles, janela em segundo plano. */
+const holds = new Set<string>();
+
+function startTimer(id: number, timer: ToastTimer): void {
+  timer.started = Date.now();
+  timer.handle = setTimeout(() => dismissToast(id), timer.remaining);
+}
+
 let toastId = 0;
-export function toast(text: string, tone: Toast['tone'] = 'info'): void {
+export function toast(text: string, tone: Toast['tone'] = 'info', action?: ToastAction): number {
   const id = ++toastId;
-  useStore.setState((s) => ({ toasts: [...s.toasts, { id, text, tone }] }));
-  setTimeout(() => useStore.setState((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })), tone === 'error' ? 6000 : 3500);
+  const current = useStore.getState().toasts;
+  for (const old of current.slice(0, Math.max(0, current.length - MAX_TOASTS + 1))) dismissToast(old.id);
+  useStore.setState((s) => ({ toasts: [...s.toasts, { id, text, tone, action }] }));
+  // Com um botão, o aviso fica mais tempo: dá para ler e decidir.
+  const timer: ToastTimer = { handle: null, remaining: action ? 12_000 : TOAST_MS[tone], started: 0 };
+  timers.set(id, timer);
+  if (!holds.size) startTimer(id, timer);
+  return id;
+}
+
+export function dismissToast(id: number): void {
+  const timer = timers.get(id);
+  if (timer?.handle) clearTimeout(timer.handle);
+  timers.delete(id);
+  useStore.setState((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+}
+
+/** Pausa (ou retoma) o sumiço automático dos avisos. */
+export function holdToasts(reason: string, hold: boolean): void {
+  const before = holds.size;
+  if (hold) holds.add(reason);
+  else holds.delete(reason);
+  if (Boolean(before) === Boolean(holds.size)) return;
+  for (const [id, timer] of timers) {
+    if (holds.size && timer.handle) {
+      clearTimeout(timer.handle);
+      timer.handle = null;
+      timer.remaining -= Date.now() - timer.started;
+    } else if (!holds.size && !timer.handle) {
+      timer.remaining = Math.max(timer.remaining, 1500);
+      startTimer(id, timer);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- seletores

@@ -2,11 +2,14 @@ name: Bug
 description: Algo não funciona como deveria
 labels: [bug]
 body:
+  - type: markdown
+    attributes:
+      value: "Dica: no app, **Ajuda → Reportar um problema…** abre este formulário com a versão e o sistema já preenchidos."
   - type: textarea
     id: what
     attributes:
       label: O que aconteceu?
-      description: O que você fez, o que esperava e o que aconteceu. Prints ajudam.
+      description: O que você fez, o que esperava e o que aconteceu. Prints ajudam (tire caminhos e dados pessoais antes).
     validations:
       required: true
   - type: textarea
@@ -21,6 +24,7 @@ body:
     id: version
     attributes:
       label: Versão do Octo
+      description: Ajuda → Versão, no menu do app.
       placeholder: 0.1.0
     validations:
       required: true
@@ -28,13 +32,25 @@ body:
     id: os
     attributes:
       label: Sistema
-      options: [Windows, macOS (Apple Silicon), macOS (Intel), Linux]
+      options:
+        - Windows
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (.deb)
+        - Linux (AppImage)
+        - Navegador (npm start)
     validations:
       required: true
+  - type: input
+    id: system
+    attributes:
+      label: Versão do sistema
+      description: Preenchido sozinho quando o formulário é aberto pelo menu Ajuda do Octo.
+      placeholder: Windows 10.0.26100 (x64) · Electron 44.7.1
   - type: input
     id: claude
     attributes:
       label: Saída de `claude --version`
   - type: markdown
     attributes:
-      value: "**Falha de segurança?** Não abra uma issue: siga o [SECURITY.md](../blob/main/SECURITY.md)."
+      value: "**Falha de segurança?** Não abra uma issue: siga a [política de segurança](https://github.com/KazuoMurakami/octo-desktop/security/policy)."

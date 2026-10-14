@@ -1,0 +1,149 @@
+/* Octo — estilos das telas (issues, sessões, configuração). Importado depois de styles.css. */
+
+/* ---------------------------------------------------------------- utilidades */
+
+/* Embrulho que só serve para dar um title (dica ao passar o mouse) sem mexer no layout. */
+.has-tooltip { display: contents; }
+
+.inline-error {
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(239, 107, 115, 0.35);
+  background: rgba(239, 107, 115, 0.07);
+  color: #ffc2c6;
+  font-size: 12.5px;
+}
+
+.empty-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+
+select.input { cursor: pointer; }
+select.input:disabled { cursor: default; opacity: 0.6; }
+
+/* ---------------------------------------------------------------- confirmação */
+
+.danger-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 6px;
+  white-space: nowrap;
+  font-weight: 600;
+  background: var(--danger);
+  color: #1a0507;
+  transition: background 0.12s;
+}
+.danger-btn:hover:not(:disabled) { background: #ff8a91; }
+.confirm-body { color: var(--text-2); }
+.confirm-body p { margin: 0 0 10px; }
+.confirm-body p:last-child { margin-bottom: 0; }
+.confirm-body strong { color: var(--text); font-weight: 600; }
+
+.foot-hint.is-warn { color: var(--warn); }
+
+/* ---------------------------------------------------------------- painel da issue */
+
+.drawer:focus { outline: none; }
+.save-state { margin-left: 8px; font-size: 11.5px; color: var(--text-3); animation: fade 0.2s ease; }
+.desc-view:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.desc-placeholder { color: var(--text-3); }
+
+/* Cards e linhas abrem pelo teclado (Enter/Espaço): o foco precisa aparecer. */
+.card:focus-visible, .row:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* ---------------------------------------------------------------- sessão do agente */
+
+/* margin-left: auto mantém os botões à direita também quando descem para uma linha própria. */
+.agent-actions { flex-wrap: wrap; justify-content: flex-end; margin-left: auto; }
+.tag.is-danger { color: var(--danger); border-color: rgba(239, 107, 115, 0.45); background: rgba(239, 107, 115, 0.1); font-weight: 600; }
+.prop-btn.is-danger-value { color: var(--danger); }
+.cost.is-estimate { color: var(--text-3); }
+
+.composer-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(229, 184, 75, 0.3);
+  background: rgba(229, 184, 75, 0.07);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.composer-warning svg { color: var(--warn); flex: none; margin-top: 2px; }
+
+/* A caixa de resposta para de crescer e rola: o botão Enviar continua à vista. */
+.composer textarea { max-height: 40vh; overflow-y: auto; }
+.slash-menu { max-height: min(320px, 45vh); overflow-y: auto; }
+
+/* ---------------------------------------------------------------- mudanças */
+
+.changes-note { margin: -4px 0 0; font-size: 12px; color: var(--text-3); }
+.change-badge {
+  flex: none;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.change-group-head {
+  padding: 6px 12px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-3);
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.changes-repo-head + .change-group-head { border-top: 0; }
+
+/* ---------------------------------------------------------------- delegar e contas */
+
+.login-needed {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(229, 184, 75, 0.35);
+  background: rgba(229, 184, 75, 0.07);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.login-needed > svg { color: var(--warn); flex: none; margin-top: 2px; }
+.login-needed > div { display: flex; flex-direction: column; gap: 4px; }
+.login-needed strong { color: var(--text); font-weight: 600; }
+.login-needed-actions { display: flex; gap: 8px; margin-top: 4px; }
+
+.accounts-more { margin-top: -4px; font-size: 12.5px; color: var(--text-3); }
+.accounts-more summary { cursor: pointer; color: var(--text-2); width: fit-content; }
+.accounts-more[open] summary { margin-bottom: 4px; }
+
+/* ---------------------------------------------------------------- conectar pasta e repositórios */
+
+.connect-empty { margin: 0; color: var(--text-2); font-size: 12.5px; }
+.connect-repos + .connect-empty, .connect-empty + .connect-empty { margin-top: 8px; }
+.connect-broad { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; color: var(--text-2); font-size: 12.5px; }
+.repos-empty {
+  margin: 4px 20px 0;
+  padding: 16px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  color: var(--text-2);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 900px;
+}
+.repos-empty p { margin: 0; }
+.repos-empty .empty-actions { justify-content: flex-start; }
+
+/* ---------------------------------------------------------------- configuração do Claude */
+
+.tab-dirty { width: 6px; height: 6px; border-radius: 50%; background: var(--warn); flex: none; }
+.tag.is-on { color: var(--ok); border-color: rgba(63, 182, 139, 0.4); }
+.code-editor-wrap { display: flex; flex-direction: column; gap: 6px; }
+.code-editor-hint { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; font-size: 11.5px; color: var(--text-3); }

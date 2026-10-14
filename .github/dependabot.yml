@@ -1,0 +1,30 @@
+# Atualizações automáticas de dependências. O Electron leva o Chromium, que recebe correções de
+# segurança com frequência; as ações do GitHub estão fixadas por SHA e só se atualizam por aqui.
+# As atualizações de segurança (Settings → Code security → Dependabot security updates) chegam na hora;
+# a espera de 7 dias vale só para as versões novas comuns, para não pegar um pacote recém-publicado com problema.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      # Electron e electron-builder sobem juntos: mudam o app empacotado e precisam do autoteste do release.
+      electron:
+        patterns: [electron, electron-builder]
+      interface:
+        patterns: [react, react-dom, '@types/react', '@types/react-dom', react-markdown, remark-gfm, lucide-react, zustand, '@fontsource-variable/*']
+      ferramentas:
+        patterns: [vite, '@vitejs/*', esbuild, typescript, '@types/node', concurrently]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ['*']

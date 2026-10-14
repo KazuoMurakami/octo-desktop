@@ -1,11 +1,15 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { Bot, Code2, FileDiff, FileText, FolderGit2, FolderPlus, Inbox, KeyRound, Plus, RefreshCw, Settings2, SlidersHorizontal, SquareTerminal } from 'lucide-react';
+import {
+  Bot, Code2, FileDiff, FileText, FolderGit2, FolderPlus, Inbox, Keyboard, KeyRound, Plus, RefreshCw, Settings2, SlidersHorizontal, SquareTerminal,
+} from 'lucide-react';
 import { api } from '../api.ts';
-import { defaultAccountId, toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
-import { repoGroups } from '../util.ts';
+import { openClaudeIn } from '../integrations.ts';
+import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
+import { modKey, repoGroups } from '../util.ts';
 import { StatusIcon } from './icons.tsx';
 import { openInEditor } from './OpenMenu.tsx';
+import { Kbd, Modal, trapTab, useDialog, useEscapeLayer } from './ui.tsx';
 
 interface Command {
   id: string;
@@ -18,27 +22,30 @@ interface Command {
 
 export function CommandPalette() {
   const open = useStore((s) => s.paletteOpen);
+  return open ? <Palette /> : null;
+}
+
+/** A paleta aberta (Ctrl/⌘ K): busca e executa ações, com o foco sempre na caixa de busca. */
+function Palette() {
   const workspace = useWorkspace();
   const repos = useWorkspaceRepos();
   const issues = useStore((s) => s.issues);
   const workspaces = useStore((s) => s.workspaces);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
-
-  useEffect(() => {
-    if (open) {
-      setQuery('');
-      setActive(0);
-    }
-  }, [open]);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const id = useId();
+  const close = () => useStore.getState().set({ paletteOpen: false });
+  useEscapeLayer(true, close, 'palette');
+  useDialog(boxRef);
 
   const commands = useMemo<Command[]>(() => {
     const { set, selectWorkspace } = useStore.getState();
     const go = (partial: Parameters<typeof set>[0]) => () => set({ ...partial, paletteOpen: false });
     const terminal = (dir?: string) => () => {
-      if (!workspace) return;
       set({ paletteOpen: false });
-      void api.openTerminal(workspace.id, { accountId: defaultAccountId(), dir }).then(() => toast('Terminal aberto com o Claude.', 'success'));
+      if (workspace) void openClaudeIn(workspace.id, dir);
     };
     const list: Command[] = [
       { id: 'new', section: 'Ações', label: 'Nova issue', icon: <Plus size={14} />, hint: 'C', run: go({ modal: { kind: 'new-issue' } }) },
@@ -53,6 +60,7 @@ export function CommandPalette() {
       },
       { id: 'connect', section: 'Ações', label: 'Conectar outra pasta', icon: <FolderPlus size={14} />, run: go({ modal: { kind: 'workspace' } }) },
       { id: 'prefs', section: 'Ações', label: 'Preferências: terminal e editor', icon: <Settings2 size={14} />, run: go({ modal: { kind: 'preferences' } }) },
+      { id: 'shortcuts', section: 'Ações', label: 'Atalhos de teclado', icon: <Keyboard size={14} />, hint: '?', run: go({ shortcutsOpen: true }) },
       { id: 'v-issues', section: 'Ir para', label: 'Issues', icon: <Inbox size={14} />, run: go({ view: 'issues' }) },
       { id: 'v-sessions', section: 'Ir para', label: 'Sessões do agente', icon: <Bot size={14} />, run: go({ view: 'sessions' }) },
       { id: 'v-repos', section: 'Ir para', label: 'Repositórios', icon: <FolderGit2 size={14} />, run: go({ view: 'repos' }) },
@@ -90,48 +98,147 @@ export function CommandPalette() {
       ? commands.filter((c) => c.label.toLowerCase().includes(q))
       : commands.filter((c) => (c.section !== 'Issues' && c.section !== 'Abrir Claude em') || c.id.startsWith('g-'))
   ).slice(0, 60);
+  const current = Math.min(active, visible.length - 1);
 
-  if (!open) return null;
-  const close = () => useStore.getState().set({ paletteOpen: false });
+  // O item destacado sempre fica à vista ao navegar com as setas.
+  useEffect(() => {
+    if (current >= 0) itemRefs.current[current]?.scrollIntoView({ block: 'nearest' });
+  }, [current]);
+
+  // A lista já vem agrupada: cada seção é um trecho contínuo.
+  const sections: { name: string; start: number; commands: Command[] }[] = [];
+  visible.forEach((command, index) => {
+    const last = sections.at(-1);
+    if (last?.name === command.section) last.commands.push(command);
+    else sections.push({ name: command.section, start: index, commands: [command] });
+  });
 
   return createPortal(
     <div className="modal-backdrop is-top" onMouseDown={(e) => e.target === e.currentTarget && close()}>
-      <div className="palette">
+      <div ref={boxRef} className="palette" role="dialog" aria-modal="true" aria-label="Paleta de comandos" tabIndex={-1} onKeyDown={trapTab}>
         <input
           autoFocus
           className="palette-input"
           placeholder="Buscar issues, repositórios ou ações…"
+          role="combobox"
+          aria-label="Buscar issues, repositórios ou ações"
+          aria-expanded="true"
+          aria-autocomplete="list"
+          aria-controls={`${id}-list`}
+          aria-activedescendant={visible[current] ? `${id}-${current}` : undefined}
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
             setActive(0);
           }}
           onKeyDown={(e) => {
-            if (e.key === 'Escape') close();
-            else if (e.key === 'ArrowDown') {
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
               e.preventDefault();
-              setActive((a) => Math.min(a + 1, visible.length - 1));
-            } else if (e.key === 'ArrowUp') {
+              setActive(Math.min(Math.max(current + (e.key === 'ArrowDown' ? 1 : -1), 0), visible.length - 1));
+            } else if (e.key === 'Enter' && visible[current]) {
               e.preventDefault();
-              setActive((a) => Math.max(a - 1, 0));
-            } else if (e.key === 'Enter' && visible[active]) visible[active].run();
+              visible[current].run();
+            }
           }}
         />
-        <div className="palette-list">
-          {visible.map((command, index) => (
-            <div key={command.id}>
-              {(index === 0 || visible[index - 1].section !== command.section) && <div className="palette-section">{command.section}</div>}
-              <button className={`palette-item${index === active ? ' is-active' : ''}`} onMouseEnter={() => setActive(index)} onClick={command.run}>
-                {command.icon}
-                <span>{command.label}</span>
-                {command.hint && <span className="dim">{command.hint}</span>}
-              </button>
+        <div className="palette-list" id={`${id}-list`} role="listbox" aria-label="Resultados">
+          {sections.map((section) => (
+            <div key={`${section.name}-${section.start}`} role="group" aria-labelledby={`${id}-section-${section.start}`}>
+              <div className="palette-section" id={`${id}-section-${section.start}`} aria-hidden>{section.name}</div>
+              {section.commands.map((command, offset) => {
+                const index = section.start + offset;
+                return (
+                  <button
+                    key={command.id}
+                    ref={(el) => {
+                      itemRefs.current[index] = el;
+                    }}
+                    id={`${id}-${index}`}
+                    type="button"
+                    role="option"
+                    aria-selected={index === current}
+                    tabIndex={-1}
+                    className={`palette-item${index === current ? ' is-active' : ''}`}
+                    onMouseDown={(e) => e.preventDefault()} // o foco fica na busca
+                    onMouseMove={() => index !== current && setActive(index)}
+                    onClick={command.run}
+                  >
+                    {command.icon}
+                    <span>{command.label}</span>
+                    {command.hint && <span className="dim">{command.hint}</span>}
+                  </button>
+                );
+              })}
             </div>
           ))}
           {!visible.length && <div className="menu-empty">Nada encontrado</div>}
         </div>
+        <div className="palette-foot" aria-hidden>
+          <span><Kbd>↑</Kbd> <Kbd>↓</Kbd> navegar</span>
+          <span><Kbd>Enter</Kbd> executar</span>
+          <span><Kbd>Esc</Kbd> fechar</span>
+        </div>
       </div>
     </div>,
     document.body,
+  );
+}
+
+// ---------------------------------------------------------------- atalhos de teclado
+
+function shortcutGroups(mod: string): { title: string; keys: [string, string][] }[] {
+  return [
+    {
+      title: 'Em qualquer tela',
+      keys: [
+        [`${mod} K`, 'Buscar issues, repositórios e ações'],
+        ['C', 'Nova issue'],
+        ['?', 'Mostrar estes atalhos'],
+        ['Esc', 'Fecha a paleta, o menu, o modal ou o painel aberto, um de cada vez'],
+      ],
+    },
+    {
+      title: 'Escrevendo',
+      keys: [
+        ['Esc', 'Num campo com texto, o primeiro Esc só sai do campo'],
+        [`${mod} Enter`, 'Envia a resposta ao agente ou cria a issue'],
+        ['/', 'No começo da resposta ao agente: lista as skills e os comandos da conta'],
+        [`${mod} S`, 'Salva skills, agentes, comandos e o settings.json'],
+      ],
+    },
+    {
+      title: 'Em menus e na paleta',
+      keys: [
+        ['↑ ↓', 'Move o destaque'],
+        ['Enter', 'Escolhe o item destacado'],
+        ['Tab', 'Sai do menu'],
+      ],
+    },
+  ];
+}
+
+/** Lista de atalhos (tecla ? ou "Atalhos de teclado" na paleta). */
+export function ShortcutsHelp() {
+  const open = useStore((s) => s.shortcutsOpen);
+  if (!open) return null;
+  const close = () => useStore.getState().set({ shortcutsOpen: false });
+  return (
+    <Modal title={<><Keyboard size={15} /> Atalhos de teclado</>} onClose={close} width={560}>
+      <div className="shortcuts">
+        {shortcutGroups(modKey()).map((group) => (
+          <section key={group.title}>
+            <h3>{group.title}</h3>
+            <dl>
+              {group.keys.map(([keys, what]) => (
+                <div key={`${keys}:${what}`} className="shortcut">
+                  <dt><Kbd>{keys}</Kbd></dt>
+                  <dd>{what}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+        ))}
+      </div>
+    </Modal>
   );
 }

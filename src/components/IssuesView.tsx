@@ -1,8 +1,9 @@
-import { useMemo, useState, type DragEvent } from 'react';
-import { Columns3, List, Plus, Search, X } from 'lucide-react';
+import { useMemo, useState, type DragEvent, type KeyboardEvent } from 'react';
+import { Columns3, List, Plus, Search, SquareTerminal, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { STATUSES, STATUS_LABEL, type AgentSession, type Issue, type IssueStatus } from '../../shared/types.ts';
 import { api } from '../api.ts';
+import { openClaudeIn } from '../integrations.ts';
 import { useStore, useWorkspaceRepos } from '../store.ts';
 import { ago } from '../util.ts';
 import { AccountAvatar, OrbitMark, PriorityIcon, StatusIcon } from './icons.tsx';
@@ -43,13 +44,15 @@ export function IssuesView() {
   const filterRepo = repos.find((r) => r.id === repoFilter);
   const statuses = showCanceled ? [...BOARD_STATUSES, 'canceled' as const] : BOARD_STATUSES;
   const ctx = { repos, accounts, latestSession };
+  const hasIssues = issues.some((i) => i.workspaceId === workspaceId);
+  const nothingShown = hasIssues && !filtered.some((i) => statuses.includes(i.status));
 
   return (
     <section className="view">
       <header className="view-head">
         <h1>Issues</h1>
         {filterRepo && (
-          <button className="filter-chip" onClick={() => set({ repoFilter: null })}>
+          <button className="filter-chip" onClick={() => set({ repoFilter: null })} title="Tirar o filtro de repositório">
             <RepoChip repo={filterRepo} />
             <X size={12} />
           </button>
@@ -57,11 +60,11 @@ export function IssuesView() {
         <div className="view-tools">
           <label className="search">
             <Search size={14} />
-            <input placeholder="Filtrar issues" value={search} onChange={(e) => set({ search: e.target.value })} />
+            <input placeholder="Filtrar issues" aria-label="Filtrar issues" value={search} onChange={(e) => set({ search: e.target.value })} />
           </label>
           <div className="segmented">
-            <button className={layout === 'board' ? 'is-on' : ''} onClick={() => set({ layout: 'board' })} title="Quadro"><Columns3 size={14} /></button>
-            <button className={layout === 'list' ? 'is-on' : ''} onClick={() => set({ layout: 'list' })} title="Lista"><List size={14} /></button>
+            <button className={layout === 'board' ? 'is-on' : ''} onClick={() => set({ layout: 'board' })} title="Quadro" aria-label="Quadro"><Columns3 size={14} /></button>
+            <button className={layout === 'list' ? 'is-on' : ''} onClick={() => set({ layout: 'list' })} title="Lista" aria-label="Lista"><List size={14} /></button>
           </div>
           <button className="ghost-btn" onClick={() => setShowCanceled((v) => !v)}>{showCanceled ? 'Ocultar canceladas' : 'Mostrar canceladas'}</button>
           <button className="primary-btn" onClick={() => set({ modal: { kind: 'new-issue', repoIds: repoFilter ? [repoFilter] : [] } })}>
@@ -70,8 +73,16 @@ export function IssuesView() {
         </div>
       </header>
 
-      {filtered.length === 0 && issues.every((i) => i.workspaceId !== workspaceId) ? (
+      {!hasIssues ? (
         <EmptyIssues />
+      ) : nothingShown ? (
+        <NoMatches
+          search={search.trim()}
+          filtered={Boolean(search.trim() || repoFilter)}
+          canceled={showCanceled ? 0 : filtered.filter((i) => i.status === 'canceled').length}
+          onClear={() => set({ search: '', repoFilter: null })}
+          onShowCanceled={() => setShowCanceled(true)}
+        />
       ) : layout === 'board' ? (
         <div className="board">
           {statuses.map((status) => (
@@ -102,6 +113,13 @@ type Ctx = {
   latestSession: Map<string, AgentSession>;
 };
 
+/** Enter ou Espaço abrem a issue focada (cards e linhas também funcionam pelo teclado). */
+function openOnKey(e: KeyboardEvent<HTMLElement>, open: () => void): void {
+  if (e.target !== e.currentTarget || (e.key !== 'Enter' && e.key !== ' ')) return;
+  e.preventDefault();
+  open();
+}
+
 function Column({ status, issues, ...ctx }: { status: IssueStatus; issues: Issue[] } & Ctx) {
   const [over, setOver] = useState(false);
   const set = useStore((s) => s.set);
@@ -128,7 +146,7 @@ function Column({ status, issues, ...ctx }: { status: IssueStatus; issues: Issue
         <StatusIcon status={status} />
         <span>{STATUS_LABEL[status]}</span>
         <span className="dim">{issues.length}</span>
-        <button className="icon-btn" onClick={() => set({ modal: { kind: 'new-issue', status } })} title="Nova issue nesta coluna"><Plus size={14} /></button>
+        <button className="icon-btn" onClick={() => set({ modal: { kind: 'new-issue', status } })} title="Nova issue nesta coluna" aria-label={`Nova issue em ${STATUS_LABEL[status]}`}><Plus size={14} /></button>
       </div>
       <div className="column-body">
         {issues.map((issue) => <Card key={issue.id} issue={issue} {...ctx} />)}
@@ -152,13 +170,18 @@ function Card({ issue, repos, accounts, latestSession }: { issue: Issue } & Ctx)
   const delegate = accounts.find((a) => a.id === issue.delegateAccountId);
   const issueRepos = repos.filter((r) => issue.repoIds.includes(r.id));
   const live = session?.state === 'active' || session?.state === 'pending';
+  const open = () => set({ openIssueId: issue.id });
 
   return (
-    <article
+    <div
       className={`card${live ? ' is-live' : ''}`}
+      role="button"
+      tabIndex={0}
+      aria-label={`${issue.identifier}: ${issue.title}`}
       draggable
       onDragStart={(e) => e.dataTransfer.setData('text/issue', issue.id)}
-      onClick={() => set({ openIssueId: issue.id })}
+      onClick={open}
+      onKeyDown={(e) => openOnKey(e, open)}
     >
       <div className="card-top">
         <span className="ident">{issue.identifier}</span>
@@ -171,15 +194,16 @@ function Card({ issue, repos, accounts, latestSession }: { issue: Issue } & Ctx)
         {issueRepos.slice(0, 2).map((repo) => <RepoChip key={repo.id} repo={repo} lit={session?.touchedRepoIds.includes(repo.id)} />)}
         {issueRepos.length > 2 && <span className="dim">+{issueRepos.length - 2}</span>}
       </div>
-    </article>
+    </div>
   );
 }
 
 function Row({ issue, repos, accounts, latestSession }: { issue: Issue } & Ctx) {
   const set = useStore((s) => s.set);
   const delegate = accounts.find((a) => a.id === issue.delegateAccountId);
+  const open = () => set({ openIssueId: issue.id });
   return (
-    <div className="row" onClick={() => set({ openIssueId: issue.id })}>
+    <div className="row" role="button" tabIndex={0} aria-label={`${issue.identifier}: ${issue.title}`} onClick={open} onKeyDown={(e) => openOnKey(e, open)}>
       <PriorityIcon priority={issue.priority} />
       <span className="ident">{issue.identifier}</span>
       <StatusIcon status={issue.status} />
@@ -194,8 +218,56 @@ function Row({ issue, repos, accounts, latestSession }: { issue: Issue } & Ctx) 
   );
 }
 
+/**
+ * Há issues, mas a busca, o filtro de repositório ou o "ocultar canceladas" esconderam todas.
+ * `canceled`: quantas correspondem ao filtro, mas estão ocultas por serem canceladas.
+ */
+function NoMatches({ search, filtered, canceled, onClear, onShowCanceled }: {
+  search: string;
+  filtered: boolean;
+  canceled: number;
+  onClear: () => void;
+  onShowCanceled: () => void;
+}) {
+  const one = canceled === 1;
+  return (
+    <div className="empty">
+      <Search size={28} className="dim" />
+      {filtered && canceled > 0 ? (
+        <>
+          <h2>
+            {search
+              ? one ? `A única issue que corresponde a “${search}” está cancelada` : `As ${canceled} issues que correspondem a “${search}” estão canceladas`
+              : one ? 'A única issue deste repositório está cancelada' : `As ${canceled} issues deste repositório estão canceladas`}
+          </h2>
+          <p>As canceladas ficam ocultas no quadro.</p>
+          <div className="empty-actions">
+            <button className="primary-btn" onClick={onShowCanceled}>Mostrar canceladas</button>
+            <button className="ghost-btn" onClick={onClear}>Limpar filtros</button>
+          </div>
+        </>
+      ) : filtered ? (
+        <>
+          <h2>{search ? `Nenhuma issue corresponde a “${search}”` : 'Nenhuma issue neste repositório'}</h2>
+          <p>A busca procura no título e no identificador (ex.: OCT-12). Limpe os filtros para ver todas as issues deste workspace.</p>
+          <button className="primary-btn" onClick={onClear}>Limpar filtros</button>
+        </>
+      ) : (
+        <>
+          <h2>Todas as issues deste workspace estão canceladas</h2>
+          <p>As canceladas ficam ocultas no quadro.</p>
+          <button className="primary-btn" onClick={onShowCanceled}>Mostrar canceladas</button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function EmptyIssues() {
-  const set = useStore((s) => s.set);
+  const { workspaceId, set } = useStore(useShallow((s) => ({ workspaceId: s.workspaceId, set: s.set })));
+  const openRoot = () => {
+    if (workspaceId) void openClaudeIn(workspaceId);
+  };
   return (
     <div className="empty">
       <OrbitMark size={40} />
@@ -204,7 +276,12 @@ function EmptyIssues() {
         Crie uma issue, marque os repositórios envolvidos e delegue para uma conta do Claude.
         Ele roda na pasta que agrupa esses repos, com o contexto de todos de uma vez.
       </p>
-      <button className="primary-btn" onClick={() => set({ modal: { kind: 'new-issue' } })}><Plus size={14} /> Criar primeira issue</button>
+      <div className="empty-actions">
+        <button className="primary-btn" onClick={() => set({ modal: { kind: 'new-issue' } })}><Plus size={14} /> Criar primeira issue</button>
+        <button className="ghost-btn" onClick={openRoot} title="Abre um terminal na raiz do workspace já rodando o Claude, sem criar issue">
+          <SquareTerminal size={14} /> Abrir Claude na raiz
+        </button>
+      </div>
     </div>
   );
 }

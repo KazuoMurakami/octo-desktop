@@ -1,8 +1,10 @@
 import type { ReactNode } from 'react';
 import { ChevronDown, Code2, FolderOpen, Settings2, SquareTerminal } from 'lucide-react';
+import type { Workspace } from '../../shared/types.ts';
 import { api } from '../api.ts';
 import { terminalLabel, useIntegrations } from '../integrations.ts';
 import { toast, useStore } from '../store.ts';
+import { relativeTo } from '../util.ts';
 import { Menu, type MenuItem } from './ui.tsx';
 
 /** O que abrir: a pasta de uma sessão (com os repositórios dela) ou uma pasta do workspace. */
@@ -12,6 +14,12 @@ export type OpenTarget =
 
 export function fileManagerName(platform: string | undefined): string {
   return platform === 'win32' ? 'Explorador de Arquivos' : platform === 'darwin' ? 'Finder' : 'gerenciador de arquivos';
+}
+
+/** Pasta relativa à raiz do workspace; a própria raiz aparece como "raiz (Nome)", e não como ".". */
+export function folderLabel(workspace: Workspace, dir: string): string {
+  const rel = relativeTo(workspace.rootPath, dir);
+  return rel === '.' ? `raiz (${workspace.name})` : rel;
 }
 
 /** Abre no editor escolhido (ou no padrão das preferências). */
@@ -30,11 +38,13 @@ export function openShellAt(target: OpenTarget): Promise<unknown> {
 }
 
 /** "Abrir em…": editores instalados, um terminal na pasta e o gerenciador de arquivos. */
-export function OpenMenu({ target, trigger, className = 'ghost-btn is-small', align = 'end' }: {
+export function OpenMenu({ target, trigger, className = 'ghost-btn is-small', align = 'end', label }: {
   target: OpenTarget;
   trigger?: ReactNode;
   className?: string;
   align?: 'start' | 'end';
+  /** Nome do gatilho (leitor de tela e dica do mouse); obrigatório na prática quando o gatilho é só um ícone. */
+  label?: string;
 }) {
   const integrations = useIntegrations();
   const platform = useStore((s) => s.meta?.platform);
@@ -72,6 +82,7 @@ export function OpenMenu({ target, trigger, className = 'ghost-btn is-small', al
       className={className}
       align={align}
       width={290}
+      label={label}
       trigger={trigger ?? <><Code2 size={13} /> Abrir em <ChevronDown size={12} /></>}
       items={items}
     />

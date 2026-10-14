@@ -1,19 +1,43 @@
 import type {
-  AccountConfig, Activity, AgentSession, AppState, AvailablePlugin, ClaudeAccount, ClaudeItem, ClaudeItemKind, Integrations, Issue, Preferences,
-  Repo, RepoChanges, ServerEvent, SessionSettings, UpdateInfo, Workspace,
+  AccountConfig, AccountStatus, Activity, AgentSession, AppState, AvailablePlugin, ClaudeAccount, ClaudeItem, ClaudeItemKind, Integrations, Issue,
+  Preferences, Repo, RepoChanges, ServerEvent, SessionSettings, UpdateInfo, Workspace,
 } from '../shared/types.ts';
 import { toast, useStore } from './store.ts';
 
-async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
-  const response = await fetch(`/api${url}`, {
-    method,
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+interface RequestOptions {
+  /** Não mostra aviso de erro: quem chamou trata a falha na própria tela. */
+  quiet?: boolean;
+  signal?: AbortSignal;
+}
+
+const OFFLINE = 'Sem conexão com o Octo. Confira se ele continua aberto e tente de novo.';
+let lastOfflineToast = 0;
+
+/** Falha de rede vira um aviso só (e não um por clique); com o banner de reconexão na tela, nem isso. */
+function offlineToast(): void {
+  if (!useStore.getState().connected || Date.now() - lastOfflineToast < 5000) return;
+  lastOfflineToast = Date.now();
+  toast(OFFLINE, 'error');
+}
+
+async function request<T>(method: string, url: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`/api${url}`, {
+      method,
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: options.signal,
+    });
+  } catch (error) {
+    if ((error as Error).name === 'AbortError') throw error;
+    if (!options.quiet) offlineToast();
+    throw new Error(OFFLINE);
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const message = (data as { error?: string }).error ?? `Erro ${response.status}`;
-    toast(message, 'error');
+    const message = (data as { error?: string }).error ?? `O Octo respondeu com erro ${response.status}.`;
+    if (!options.quiet) toast(message, 'error');
     throw new Error(message);
   }
   return data as T;
@@ -38,6 +62,8 @@ export interface FolderInspection {
   path: string;
   name: string;
   repos: string[];
+  /** A busca parou no limite de pastas: a lista pode estar incompleta. */
+  partial?: boolean;
 }
 
 /** Para a API, '' em model/effort significa "padrão da conta" (sem flag). */
@@ -57,14 +83,16 @@ export const api = {
   state: () => request<AppState>('GET', '/state'),
 
   pickFolder: () => post<{ path: string | null }>('/fs/pick-folder'),
-  inspectFolder: (path: string, scanDepth: number) => post<FolderInspection>('/fs/inspect', { path, scanDepth }),
+  /** Sem aviso de erro: a prévia da pasta mostra o motivo, e a busca é cancelada quando o caminho muda. */
+  inspectFolder: (path: string, scanDepth: number, signal?: AbortSignal) =>
+    request<FolderInspection>('POST', '/fs/inspect', { path, scanDepth }, { quiet: true, signal }),
 
   createWorkspace: (body: { rootPath: string; name: string; key: string; scanDepth: number }) => post<Workspace>('/workspaces', body),
   updateWorkspace: (id: string, body: Partial<Workspace>) => patch<Workspace>(`/workspaces/${id}`, body),
   deleteWorkspace: (id: string) => request('DELETE', `/workspaces/${id}`),
   scan: (id: string) => post<Repo[]>(`/workspaces/${id}/scan`),
-  context: (id: string, dir?: string) =>
-    request<ContextInfo>('GET', `/workspaces/${id}/context${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`),
+  context: (id: string, dir?: string, quiet = false) =>
+    request<ContextInfo>('GET', `/workspaces/${id}/context${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`, undefined, { quiet }),
   writeContext: (id: string, dir?: string) => post<{ file: string }>(`/workspaces/${id}/context`, { dir }),
   openTerminal: (id: string, body: { accountId?: string; dir?: string }) => post<AgentSession>(`/workspaces/${id}/terminal`, body),
   reveal: (id: string, dir?: string) => post(`/workspaces/${id}/reveal`, { dir }),
@@ -72,7 +100,7 @@ export const api = {
   createAccount: (body: { name: string; configDir: string; inherit: boolean }) => post<ClaudeAccount>('/accounts', body),
   updateAccount: (id: string, body: Partial<ClaudeAccount>) => patch<ClaudeAccount>(`/accounts/${id}`, body),
   deleteAccount: (id: string) => request('DELETE', `/accounts/${id}`),
-  refreshAccount: (id: string) => post(`/accounts/${id}/status`),
+  refreshAccount: (id: string, quiet = false) => request<AccountStatus>('POST', `/accounts/${id}/status`, {}, { quiet }),
   login: (id: string) => post(`/accounts/${id}/login`),
 
   accountConfig: (id: string, cwd?: string, fresh = false) => request<AccountConfig>('GET', `/accounts/${id}/config${query({ cwd, fresh: fresh ? '1' : undefined })}`),
@@ -94,21 +122,26 @@ export const api = {
   setPreferences: (body: Partial<Preferences>) => patch<Integrations>('/preferences', body),
   openEditor: (workspaceId: string, body: { dir?: string; repoIds?: string[]; editor?: string }) => post<{ editor: string }>(`/workspaces/${workspaceId}/open-editor`, body),
   openShell: (workspaceId: string, dir?: string) => post(`/workspaces/${workspaceId}/shell`, { dir }),
-  folderChanges: (workspaceId: string, dir?: string) => request<RepoChanges[]>('GET', `/workspaces/${workspaceId}/changes${query({ dir })}`),
+  /** `quiet`: a tela de mudanças mostra a falha com "Tentar de novo" em vez de um aviso. */
+  folderChanges: (workspaceId: string, dir?: string, quiet = false) =>
+    request<RepoChanges[]>('GET', `/workspaces/${workspaceId}/changes${query({ dir })}`, undefined, { quiet }),
   openSessionEditor: (sessionId: string, editor?: string) => post<{ editor: string }>(`/sessions/${sessionId}/open-editor`, { editor }),
   openSessionShell: (sessionId: string) => post(`/sessions/${sessionId}/shell`),
-  sessionChanges: (sessionId: string) => request<RepoChanges[]>('GET', `/sessions/${sessionId}/changes`),
+  sessionChanges: (sessionId: string, quiet = false) => request<RepoChanges[]>('GET', `/sessions/${sessionId}/changes`, undefined, { quiet }),
 
   createIssue: (workspaceId: string, body: Partial<Issue>) => post<Issue>(`/workspaces/${workspaceId}/issues`, body),
   updateIssue: (id: string, body: Partial<Issue>) => patch<Issue>(`/issues/${id}`, body),
   deleteIssue: (id: string) => request('DELETE', `/issues/${id}`),
   delegate: (id: string, body: DelegateInput) => post<AgentSession>(`/issues/${id}/delegate`, body),
 
-  activities: (sessionId: string) => request<Activity[]>('GET', `/sessions/${sessionId}/activities`),
+  /** `quiet`: o feed mostra a falha com "Tentar de novo" em vez de um aviso. */
+  activities: (sessionId: string, quiet = false) => request<Activity[]>('GET', `/sessions/${sessionId}/activities`, undefined, { quiet }),
   message: (sessionId: string, text: string, allowedTools: string[] = [], changes: Partial<SettingsInput> = {}) =>
     post<AgentSession>(`/sessions/${sessionId}/message`, { text, allowedTools, ...changes }),
   stop: (sessionId: string) => post(`/sessions/${sessionId}/stop`),
   dismissDenials: (sessionId: string) => post(`/sessions/${sessionId}/dismiss-denials`),
+  /** Sessão de terminal (ou aguardando você) encerrada pela interface: vira concluída. */
+  finish: (sessionId: string) => post<{ ok: true }>(`/sessions/${sessionId}/finish`),
   resumeInTerminal: (sessionId: string) => post<AgentSession>(`/sessions/${sessionId}/terminal`),
   sync: (sessionId: string) => post<{ count: number }>(`/sessions/${sessionId}/sync`),
 };
@@ -127,6 +160,21 @@ export async function authenticate(): Promise<void> {
 export function connect(): () => void {
   let source: EventSource | null = null;
   let closed = false;
+  /** Cada (re)conexão começa uma carga nova; tentativas de uma conexão anterior param sozinhas. */
+  let generation = 0;
+
+  // Se a carga falhar (servidor reiniciando, por exemplo), tenta de novo com intervalos crescentes,
+  // em vez de deixar a tela presa em "Carregando…".
+  const loadState = (gen: number, attempt = 0) => {
+    request<AppState>('GET', '/state', undefined, { quiet: true })
+      .then((state) => {
+        if (!closed && gen === generation) useStore.getState().hydrate(state);
+      })
+      .catch(() => {
+        if (closed || gen !== generation) return;
+        setTimeout(() => loadState(gen, attempt + 1), Math.min(30_000, 1000 * 2 ** attempt));
+      });
+  };
 
   const open = async () => {
     // Sem o cookie de acesso, o EventSource só falharia em silêncio: avisa a interface.
@@ -139,9 +187,9 @@ export function connect(): () => void {
     source = new EventSource('/api/events');
     source.onopen = () => {
       // A cada (re)conexão recarregamos o estado inteiro para não perder eventos.
-      api.state().then((state) => useStore.getState().hydrate(state)).catch(() => undefined);
+      loadState(++generation);
       for (const sessionId of Object.keys(useStore.getState().activities)) {
-        api.activities(sessionId).then((list) => useStore.getState().mergeActivities(sessionId, list)).catch(() => undefined);
+        api.activities(sessionId, true).then((list) => useStore.getState().mergeActivities(sessionId, list)).catch(() => undefined);
       }
       useStore.setState({ connected: true });
     };

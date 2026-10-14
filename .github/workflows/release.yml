@@ -1,5 +1,6 @@
-# Publicar uma versão: atualize "version" no package.json, crie a tag e envie.
-#   git tag v0.2.0 && git push origin v0.2.0
+# Publicar uma versão (passo a passo em docs/publicar-versao.md):
+#   npm version 0.2.0        # atualiza package.json e package-lock.json, cria o commit e a tag v0.2.0
+#   git push --follow-tags
 # Cada sistema gera e testa o seu instalador; o último job monta um rascunho de release com
 # todos eles, os checksums SHA-256 e a atestação de proveniência (gh attestation verify).
 name: Release
@@ -10,6 +11,8 @@ on:
   workflow_dispatch:
 
 # Ações de terceiros fixadas por SHA; só o job que publica pode escrever no repositório.
+# Sem cache dos downloads do Electron: uma tag só aproveitaria cache gravado pela main, e o
+# electron-builder reaproveita a pasta já extraída sem conferir de novo o conteúdo.
 permissions:
   contents: read
 
@@ -20,28 +23,97 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            selftest: ./release/win-unpacked/Octo.exe --self-test
           - os: macos-latest
-            selftest: ./release/mac-arm64/Octo.app/Contents/MacOS/Octo --self-test
-          - os: ubuntu-latest
-            selftest: xvfb-run -a ./release/linux-unpacked/octo --no-sandbox --self-test
+          # Fixo: o ubuntu-latest passa para o 26.04 entre outubro e novembro de 2026.
+          - os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
+      - name: A tag bate com a versão do package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          package="v$(node -p "require('./package.json').version")"
+          lock="v$(node -p "require('./package-lock.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$package" ] || [ "$GITHUB_REF_NAME" != "$lock" ]; then
+            echo "::error::A tag $GITHUB_REF_NAME não bate com o package.json ($package) ou o package-lock.json ($lock). Crie a versão com: npm version <versão> && git push --follow-tags"
+            exit 1
+          fi
+          grep -qE "^## ${package#v}( |$)" CHANGELOG.md || echo "::warning::O CHANGELOG.md ainda não tem a seção ${package#v}."
+      # O electron-builder baixa o Electron de cada arquitetura que empacota; o do npm não é usado aqui.
       - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      - run: npm run typecheck
       - run: npm run dist
         env:
-          # Sem certificado de assinatura (veja "Primeira abertura" no README).
+          # Sem certificado pago. No macOS a assinatura é ad-hoc (mac.identity "-" no electron-builder.yml).
           CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Fuses do Electron
+        run: |
+          case "$RUNNER_OS" in
+            Windows) node scripts/check-fuses.mjs release/win-unpacked/Octo.exe ;;
+            macOS) for app in release/mac-arm64/Octo.app release/mac/Octo.app; do node scripts/check-fuses.mjs "$app"; done ;;
+            Linux) node scripts/check-fuses.mjs release/linux-unpacked/octo ;;
+          esac
+      - name: Assinatura do app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          for app in release/mac-arm64/Octo.app release/mac/Octo.app; do
+            # A mesma checagem estrutural que o Gatekeeper faz (o spctl recusa por não ter Developer ID, como esperado).
+            codesign --verify --deep --strict --verbose=2 "$app"
+            info=$(codesign -dv "$app" 2>&1)
+            echo "$info"
+            case "$info" in
+              *"Identifier=io.github.kazuomurakami.octo"*) ;;
+              *) echo "::error::$app não está assinado com o appId esperado."; exit 1 ;;
+            esac
+            entitlements=$(codesign -d --entitlements - --xml "$app" 2>/dev/null)
+            case "$entitlements" in
+              *com.apple.security.automation.apple-events*) ;;
+              *) echo "::error::$app está sem a permissão de Apple Events (build/entitlements.mac.plist)."; exit 1 ;;
+            esac
+            /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$app/Contents/Info.plist"
+          done
+      - name: Sandbox do Chromium no Ubuntu 24.04
+        if: runner.os == 'Linux'
+        # O 24.04 restringe user namespaces; o .deb instala um perfil AppArmor que libera o Octo.
+        # Aqui a restrição é desligada para o autoteste rodar com o sandbox, como no app instalado.
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Autoteste do app empacotado
-        shell: bash
+        timeout-minutes: 5
         env:
           OCTO_DATA_DIR: ${{ runner.temp }}/octo-selftest
-        run: ${{ matrix.selftest }}
+        run: |
+          case "$RUNNER_OS" in
+            Windows) ./release/win-unpacked/Octo.exe --self-test ;;
+            macOS) ./release/mac-arm64/Octo.app/Contents/MacOS/Octo --self-test ;;
+            Linux) xvfb-run -a ./release/linux-unpacked/octo --self-test ;;
+          esac
+      - name: Autoteste do app Intel no Rosetta (macOS)
+        if: runner.os == 'macOS'
+        # O runner do macOS é Apple Silicon: o app Intel roda no Rosetta 2, instalado aqui se faltar.
+        # A primeira abertura traduz o Electron inteiro, por isso o prazo maior.
+        timeout-minutes: 10
+        env:
+          OCTO_DATA_DIR: ${{ runner.temp }}/octo-selftest-x64
+        run: |
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          arch -x86_64 ./release/mac/Octo.app/Contents/MacOS/Octo --self-test
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: octo-${{ matrix.os }}
@@ -55,7 +127,8 @@ jobs:
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
@@ -68,13 +141,18 @@ jobs:
       - name: Checksums SHA-256
         working-directory: artifacts
         run: sha256sum * | tee SHA256SUMS.txt
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      - id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             artifacts/*.exe
             artifacts/*.dmg
             artifacts/*.AppImage
             artifacts/*.deb
+      - name: Atestação junto da release (para verificar sem login no GitHub)
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" "artifacts/Octo-$GITHUB_REF_NAME.sigstore.json"
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true

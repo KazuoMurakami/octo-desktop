@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { statSync } from 'node:fs';
 import type { AgentSession, ClaudeAccount, HistoryKind, Issue, Repo, Workspace } from '../shared/types.ts';
 import { broadcast } from './events.ts';
 import { db, save } from './store.ts';
@@ -9,6 +10,17 @@ export class HttpError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+/** Garante que a pasta existe antes de abrir algo nela (ela pode ter sido movida ou apagada). */
+export function requireFolder(dir: string, message = `A pasta ${dir} não existe mais. Ela pode ter sido movida, renomeada ou apagada.`): void {
+  let ok = false;
+  try {
+    ok = statSync(dir).isDirectory();
+  } catch {
+    /* não existe */
+  }
+  if (!ok) throw new HttpError(400, message);
 }
 
 export function now(): string {

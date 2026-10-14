@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Bot, ChevronDown, FolderOpen, SquareTerminal, Trash2, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { Bot, ChevronDown, Ellipsis, FolderOpen, SquareTerminal, Trash2, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { PRIORITY_LABEL, STATUSES, STATUS_LABEL, type Issue, type Priority } from '../../shared/types.ts';
 import { api } from '../api.ts';
 import { useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
-import { ago, commonFolder, hue, relativeTo } from '../util.ts';
+import { ago, commonFolder, hue } from '../util.ts';
+import { loginHint } from './AccountsView.tsx';
 import { AgentSessionView } from './AgentSession.tsx';
-import { OpenMenu } from './OpenMenu.tsx';
+import { ConfirmDialog } from './modals.tsx';
+import { OpenMenu, folderLabel } from './OpenMenu.tsx';
 import { AccountAvatar, OrbitMark, PriorityIcon, SessionBadge, StatusIcon } from './icons.tsx';
-import { AutoTextarea, Markdown, Menu, RepoChip } from './ui.tsx';
+import { AutoTextarea, Markdown, Menu, RepoChip, trapTab } from './ui.tsx';
 
 /** Painel lateral: issue aberta ou uma sessão avulsa (sem issue). */
 export function Drawer() {
@@ -18,30 +20,71 @@ export function Drawer() {
   const issue = useStore((s) => s.issues.find((i) => i.id === openIssueId));
   const session = useStore((s) => s.sessions.find((x) => x.id === openSessionId));
   if (!issue && !session) return null;
-  const close = () => set({ openIssueId: null, openSessionId: null });
+  const close = () => {
+    // Tira o foco antes de fechar: o campo em edição dispara o onBlur (e salva) enquanto ainda está na tela.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    set({ openIssueId: null, openSessionId: null });
+  };
 
   return (
-    <div className="drawer-backdrop" onMouseDown={(e) => e.target === e.currentTarget && close()}>
-      <div className="drawer">
-        {issue ? (
-          <IssueDetail issue={issue} onClose={close} />
-        ) : (
-          session && (
-            <>
-              <header className="drawer-head">
-                <span className="crumb"><Bot size={14} /> {session.title}</span>
-                <button className="icon-btn" onClick={close}><X size={16} /></button>
-              </header>
-              <div className="drawer-session"><AgentSessionView key={session.id} session={session} /></div>
-            </>
-          )
-        )}
+    <DrawerShell label={issue ? `${issue.identifier} · ${issue.title}` : (session?.title ?? 'Sessão')} onClose={close}>
+      {issue ? (
+        // A key remonta o detalhe ao trocar de issue com o painel aberto (Ctrl+K): nada da anterior fica para trás.
+        <IssueDetail key={issue.id} issue={issue} initialSessionId={openSessionId} onClose={close} />
+      ) : (
+        session && (
+          <>
+            <header className="drawer-head">
+              <span className="crumb"><Bot size={14} /> {session.title}</span>
+              <button className="icon-btn" onClick={close} title="Fechar (Esc)" aria-label="Fechar"><X size={16} /></button>
+            </header>
+            <div className="drawer-session"><AgentSessionView key={session.id} session={session} /></div>
+          </>
+        )
+      )}
+    </DrawerShell>
+  );
+}
+
+/**
+ * Moldura do painel com semântica de diálogo: recebe o foco ao abrir, prende o Tab dentro dele
+ * e devolve o foco a quem o abriu ao fechar. O fundo (navegação e tela) fica inerte em App.tsx.
+ */
+function DrawerShell({ label, onClose, children }: { label: string; onClose: () => void; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Lido antes do primeiro commit: o autoFocus de dentro do painel já teria mudado o foco.
+  const [returnTo] = useState(() => (document.activeElement instanceof HTMLElement ? document.activeElement : null));
+
+  useEffect(() => {
+    const el = ref.current;
+    if (el && !el.contains(document.activeElement)) el.focus({ preventScroll: true });
+    return () => {
+      // Só quando o painel saiu da tela de fato (no StrictMode o efeito também roda de novo sem desmontar)
+      // e ninguém pegou o foco depois.
+      const active = document.activeElement;
+      if (el && !el.isConnected && (!active || active === document.body) && returnTo?.isConnected) returnTo.focus({ preventScroll: true });
+    };
+  }, [returnTo]);
+
+  return (
+    <div className="drawer-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div
+        ref={ref}
+        className="drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        tabIndex={-1}
+        // Um Tab já usado lá dentro (ex.: escolher uma /skill no composer) não move o foco.
+        onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => !e.defaultPrevented && trapTab(e)}
+      >
+        {children}
       </div>
     </div>
   );
 }
 
-function IssueDetail({ issue, onClose }: { issue: Issue; onClose: () => void }) {
+function IssueDetail({ issue, initialSessionId, onClose }: { issue: Issue; initialSessionId: string | null; onClose: () => void }) {
   const workspace = useWorkspace();
   const repos = useWorkspaceRepos();
   const { accounts, accountStatus, set } = useStore(useShallow((s) => ({ accounts: s.accounts, accountStatus: s.accountStatus, set: s.set })));
@@ -50,48 +93,115 @@ function IssueDetail({ issue, onClose }: { issue: Issue; onClose: () => void }) 
     () => allSessions.filter((s) => s.issueId === issue.id).sort((a, b) => b.startedAt.localeCompare(a.startedAt)),
     [allSessions, issue.id],
   );
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  // Aberta por "Sessões do agente": mostra a sessão clicada, e não a mais recente.
+  const [sessionId, setSessionId] = useState<string | null>(() =>
+    initialSessionId && sessions.some((s) => s.id === initialSessionId) ? initialSessionId : null,
+  );
   const [title, setTitle] = useState(issue.title);
   const [description, setDescription] = useState(issue.description);
   const [editing, setEditing] = useState(!issue.description);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
+  // Quando uma sessão nova começa depois que o painel abriu, ela passa a ser a exibida.
+  const newest = sessions[0]?.id ?? null;
+  const seenNewest = useRef(newest);
   useEffect(() => {
-    setTitle(issue.title);
-    setDescription(issue.description);
+    if (newest === seenNewest.current) return;
+    seenNewest.current = newest;
+    setSessionId(newest);
+  }, [newest]);
+
+  // Pedido para mostrar uma sessão (lista de sessões, aviso "Ver"), também com o painel já aberto nesta
+  // issue. Depois de lido, o pedido sai do store: não deve valer para a próxima issue aberta pelo Ctrl+K.
+  useEffect(() => {
+    if (!initialSessionId) return;
+    if (sessions.some((s) => s.id === initialSessionId)) setSessionId(initialSessionId);
+    useStore.getState().set({ openSessionId: null });
+  }, [initialSessionId]);
+
+  // ---- título e descrição: salvos durante a digitação (após uma pausa) e, por garantia, ao fechar o painel.
+  const draft = useRef({ title: issue.title, description: issue.description });
+  const saved = useRef({ title: issue.title, description: issue.description });
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const removed = useRef(false);
+
+  const flush = useCallback(() => {
+    clearTimeout(timer.current);
+    if (removed.current) return;
+    const body: Partial<Issue> = {};
+    const nextTitle = draft.current.title.trim();
+    if (nextTitle && nextTitle !== saved.current.title) body.title = nextTitle;
+    if (draft.current.description !== saved.current.description) body.description = draft.current.description;
+    if (body.title === undefined && body.description === undefined) return;
+    // A issue pode ter sido excluída (aqui ou em outra janela) com o painel aberto.
+    if (!useStore.getState().issues.some((i) => i.id === issue.id)) return;
+    const previous = saved.current;
+    saved.current = { title: body.title ?? previous.title, description: body.description ?? previous.description };
+    setSaveState('saving');
+    api.updateIssue(issue.id, body).then(
+      () => setSaveState('saved'),
+      () => {
+        saved.current = previous; // a próxima pausa ou o fechamento tentam de novo
+        setSaveState('idle');
+      },
+    );
   }, [issue.id]);
 
-  // Quando uma sessão nova começa, ela passa a ser a exibida.
-  useEffect(() => setSessionId(sessions[0]?.id ?? null), [sessions[0]?.id]);
+  const edit = (changes: Partial<typeof draft.current>) => {
+    draft.current = { ...draft.current, ...changes };
+    clearTimeout(timer.current);
+    timer.current = setTimeout(flush, 700);
+  };
+
+  // Fechar com Esc ou clicando fora desmonta o campo sem onBlur: grava o que faltar aqui.
+  useEffect(() => () => flush(), [flush]);
+
+  useEffect(() => {
+    if (saveState !== 'saved') return;
+    const hide = setTimeout(() => setSaveState('idle'), 2500);
+    return () => clearTimeout(hide);
+  }, [saveState]);
 
   const session = sessions.find((s) => s.id === sessionId) ?? sessions[0];
-  const delegate = accounts.find((a) => a.id === issue.delegateAccountId);
+  const account = accounts.find((a) => a.id === issue.delegateAccountId);
+  const workspaceAccount = accounts.find((a) => a.id === workspace?.defaultAccountId) ?? accounts[0];
   const issueRepos = repos.filter((r) => issue.repoIds.includes(r.id));
   const cwd = workspace ? commonFolder(workspace, issueRepos) : '';
+  const folder = workspace ? folderLabel(workspace, cwd) : '';
+  const running = sessions.some((s) => s.state === 'active' || s.state === 'pending');
   const update = (body: Partial<Issue>) => api.updateIssue(issue.id, body);
 
-  const saveText = () => {
-    if (title.trim() && title !== issue.title) void update({ title });
-    if (description !== issue.description) void update({ description });
+  const remove = async () => {
+    removed.current = true;
+    clearTimeout(timer.current);
+    try {
+      await api.deleteIssue(issue.id);
+    } catch (error) {
+      removed.current = false;
+      throw error;
+    }
+    onClose();
   };
 
   return (
     <>
       <header className="drawer-head">
-        <span className="crumb">{workspace?.name} <span className="dim">›</span> <span className="ident">{issue.identifier}</span></span>
+        <span className="crumb">
+          {workspace?.name} <span className="dim">›</span> <span className="ident">{issue.identifier}</span>
+          {saveState !== 'idle' && <span className="save-state" aria-live="polite">{saveState === 'saving' ? 'Salvando…' : 'Salvo'}</span>}
+        </span>
         <div className="drawer-head-actions">
-          <button
-            className="icon-btn is-danger"
-            title="Excluir issue"
-            onClick={() => {
-              if (confirm(`Excluir ${issue.identifier}?`)) {
-                void api.deleteIssue(issue.id);
-                onClose();
-              }
-            }}
-          >
-            <Trash2 size={15} />
-          </button>
-          <button className="icon-btn" onClick={onClose} title="Fechar (Esc)"><X size={16} /></button>
+          {/* Longe do X: excluir passa por um menu e por uma confirmação. */}
+          <Menu
+            className="icon-btn"
+            align="end"
+            width={220}
+            label="Mais ações"
+            trigger={<Ellipsis size={16} />}
+            items={[{ key: 'delete', label: 'Excluir issue…', icon: <Trash2 size={14} />, danger: true, onSelect: () => setConfirmDelete(true) }]}
+          />
+          <button className="icon-btn" onClick={onClose} title="Fechar (Esc)" aria-label="Fechar"><X size={16} /></button>
         </div>
       </header>
 
@@ -99,27 +209,50 @@ function IssueDetail({ issue, onClose }: { issue: Issue; onClose: () => void }) 
         <div className="drawer-main">
           <input
             className="title-input"
+            aria-label="Título da issue"
             value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            onBlur={saveText}
+            onChange={(e) => {
+              setTitle(e.target.value);
+              edit({ title: e.target.value });
+            }}
+            onBlur={flush}
             onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
           />
           {editing ? (
             <AutoTextarea
               className="desc-input"
-              autoFocus={!issue.description}
+              autoFocus
+              aria-label="Descrição"
               placeholder="Descreva o que precisa ser feito. Markdown funciona. Este texto vira o prompt do Claude."
               value={description}
               minRows={4}
-              onChange={(e) => setDescription(e.target.value)}
+              onFocus={(e) => {
+                const end = e.currentTarget.value.length;
+                e.currentTarget.setSelectionRange(end, end);
+              }}
+              onChange={(e) => {
+                setDescription(e.target.value);
+                edit({ description: e.target.value });
+              }}
               onBlur={() => {
-                saveText();
+                flush();
                 if (description.trim()) setEditing(false);
               }}
             />
           ) : (
-            <div className="desc-view" onClick={() => setEditing(true)} title="Clique para editar">
-              <Markdown>{description}</Markdown>
+            <div
+              className="desc-view"
+              tabIndex={0}
+              title="Clique ou aperte Enter para editar"
+              onClick={() => setEditing(true)}
+              onKeyDown={(e) => {
+                if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                  e.preventDefault();
+                  setEditing(true);
+                }
+              }}
+            >
+              {description.trim() ? <Markdown>{description}</Markdown> : <span className="desc-placeholder">Adicionar descrição…</span>}
             </div>
           )}
 
@@ -147,8 +280,7 @@ function IssueDetail({ issue, onClose }: { issue: Issue; onClose: () => void }) 
             ) : (
               <div className="agent-empty">
                 <p>
-                  Delegue esta issue: o Claude roda em{' '}
-                  <code>{workspace ? relativeTo(workspace.rootPath, cwd) : '.'}</code>
+                  Delegue esta issue: o Claude roda em <code>{folder || '—'}</code>
                   {issueRepos.length > 1 ? ` com o contexto de ${issueRepos.length} repositórios` : ''} e relata o andamento aqui.
                 </p>
                 <div className="agent-empty-actions">
@@ -183,15 +315,20 @@ function IssueDetail({ issue, onClose }: { issue: Issue; onClose: () => void }) 
               }))}
             />
           </Prop>
-          <Prop label="Delegado">
+          {/* Só escolhe a conta usada ao delegar; não inicia nada sozinho. */}
+          <Prop label="Conta" hint="A conta do Claude usada quando você delega esta issue. Trocar aqui não inicia nada: para o Claude começar, use “Delegar ao Claude”.">
             <Menu
               className="prop-btn"
-              trigger={<><AccountAvatar account={delegate} size={16} /> {delegate?.name ?? 'Ninguém'}</>}
+              width={280}
+              trigger={<><AccountAvatar account={account} size={16} /> {account?.name ?? <span className="dim">Padrão do workspace</span>}</>}
               items={[
-                { key: 'none', label: 'Ninguém', icon: <AccountAvatar size={16} />, selected: !delegate, onSelect: () => update({ delegateAccountId: null }) },
+                {
+                  key: 'none', label: 'Padrão do workspace', hint: workspaceAccount?.name ?? '', icon: <AccountAvatar size={16} />,
+                  selected: !account, onSelect: () => update({ delegateAccountId: null }),
+                },
                 ...accounts.map((a) => ({
-                  key: a.id, label: a.name, hint: accountStatus[a.id]?.email ?? '', icon: <AccountAvatar account={a} size={16} />,
-                  selected: a.id === delegate?.id, onSelect: () => update({ delegateAccountId: a.id }),
+                  key: a.id, label: a.name, hint: loginHint(accountStatus[a.id]), icon: <AccountAvatar account={a} size={16} />,
+                  selected: a.id === account?.id, onSelect: () => update({ delegateAccountId: a.id }),
                 })),
               ]}
             />
@@ -221,7 +358,7 @@ function IssueDetail({ issue, onClose }: { issue: Issue; onClose: () => void }) 
                 className="prop-btn mono"
                 align="start"
                 target={{ kind: 'folder', workspaceId: workspace.id, dir: cwd, repoIds: issueRepos.length ? issueRepos.map((r) => r.id) : undefined }}
-                trigger={<><FolderOpen size={13} /> {relativeTo(workspace.rootPath, cwd)}</>}
+                trigger={<><FolderOpen size={13} /> {folder}</>}
               />
             ) : '—'}
           </Prop>
@@ -244,13 +381,32 @@ function IssueDetail({ issue, onClose }: { issue: Issue; onClose: () => void }) 
           </div>
         </aside>
       </div>
+
+      {confirmDelete && (
+        <ConfirmDialog
+          title={`Excluir ${issue.identifier}?`}
+          confirmLabel="Excluir issue"
+          busyLabel="Excluindo…"
+          onConfirm={remove}
+          onClose={() => setConfirmDelete(false)}
+        >
+          <p>
+            A issue “{issue.title}” sai do quadro, com a descrição e o histórico.
+            {running && <> <strong>O agente que está trabalhando nela será interrompido.</strong></>}
+          </p>
+          <p>
+            {sessions.length > 0 ? 'As sessões do agente continuam em Sessões do agente. ' : ''}
+            Nada muda nos arquivos dos repositórios.
+          </p>
+        </ConfirmDialog>
+      )}
     </>
   );
 }
 
-function Prop({ label, children }: { label: string; children: ReactNode }) {
+function Prop({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
-    <div className="prop">
+    <div className="prop" title={hint}>
       <span className="prop-label">{label}</span>
       {children}
     </div>

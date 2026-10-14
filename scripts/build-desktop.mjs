@@ -9,7 +9,10 @@ import { build as buildWeb } from 'vite';
 // (fs.rmSync do Node 24 anterior ao 24.21 ignora caminhos com acento no Windows; o rm assíncrono não.)
 for (const dir of ['dist', 'dist-electron']) await rm(dir, { recursive: true, force: true });
 
-await buildWeb();
+// O instalador leva o código das bibliotecas da interface (React, react-markdown, lucide…), então
+// leva também os avisos de licença delas: o Vite junta o texto da licença de cada pacote que
+// entrou no bundle.
+await buildWeb({ build: { license: { fileName: 'licenses/THIRD_PARTY_NOTICES.md' } } });
 
 mkdirSync('dist-electron', { recursive: true });
 await build({
@@ -26,9 +29,13 @@ await build({
 
 // terminal.ts lê o launcher ao lado do bundle (ver import.meta.url lá).
 copyFileSync('server/launcher.mjs', 'dist-electron/launcher.mjs');
+// Imagem da tela "Iniciando o Octo…", mostrada enquanto o servidor sobe (electron/main.ts).
+copyFileSync('src/assets/octo-mark.png', 'dist-electron/splash-mark.png');
 
-// As fontes vão junto com o app; a licença delas (SIL OFL 1.1) exige que o texto as acompanhe.
 mkdirSync('dist/licenses', { recursive: true });
+// A licença do próprio Octo (MIT) acompanha o instalador.
+copyFileSync('LICENSE', 'dist/licenses/LICENSE-Octo.txt');
+// As fontes vão junto com o app; a licença delas (SIL OFL 1.1) exige que o texto as acompanhe.
 for (const font of ['hanken-grotesk', 'jetbrains-mono']) {
   copyFileSync(`node_modules/@fontsource-variable/${font}/LICENSE`, `dist/licenses/${font}-OFL.txt`);
 }

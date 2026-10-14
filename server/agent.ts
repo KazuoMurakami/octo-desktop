@@ -3,13 +3,18 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
-import type {
-  Activity, AgentSession, ClaudeAccount, Issue, PermissionDenial, Repo, SessionSettings, Workspace,
+import {
+  EFFORT_LABEL, PERMISSION_LABEL,
+  type Activity, type AgentSession, type ClaudeAccount, type Issue, type PermissionDenial, type PermissionMode, type Repo, type SessionSettings,
+  type Workspace,
 } from '../shared/types.ts';
-import { claudeEnv, requireClaude } from './claude.ts';
+import { dirtyEntries } from './changes.ts';
+import { claudeEnv, requireClaude, type ClaudeCommand } from './claude.ts';
 import { broadcast } from './events.ts';
-import { addHistory, commitIssue, commitSession, now, workspaceRepos } from './model.ts';
-import { appendActivity, db, readActivities, writeActivities } from './store.ts';
+import { HttpError, addHistory, commitIssue, commitSession, now, requireFolder, workspaceRepos } from './model.ts';
+import { describeRepos } from './scanner.ts';
+import { appendActivity, db, readActivities, save, writeActivities, writeBaseline } from './store.ts';
+import { describeSpawnError, fitsCommandLine, shrinkToFit } from './system.ts';
 import { openClaudeTerminal } from './terminal.ts';
 
 interface Run {
@@ -18,12 +23,23 @@ interface Run {
   gotResult: boolean;
   stderr: string;
   lastMessage: Activity | null;
+  /** SIGKILL agendado depois do Parar (macOS/Linux), caso o processo não saia sozinho. */
+  killTimer: NodeJS.Timeout | null;
 }
 
 const runs = new Map<string, Run>();
 
+/** Sessões cujo terminal está abrindo (resumeInTerminal esperando a janela). */
+const opening = new Set<string>();
+
 export function isRunning(sessionId: string): boolean {
   return runs.has(sessionId);
+}
+
+/** Ainda trabalhando: uma execução que já entregou o resultado só está saindo. */
+function working(sessionId: string): boolean {
+  const run = runs.get(sessionId);
+  return Boolean(run && !run.gotResult);
 }
 
 // ---------------------------------------------------------------- prompts
@@ -156,7 +172,14 @@ function touchedRepos(session: AgentSession, input: Record<string, any>): string
 function rel(session: AgentSession, p: unknown): string {
   if (typeof p !== 'string') return '';
   const relative = path.relative(session.cwd, p);
-  return (relative && !relative.startsWith('..') ? relative : p).replace(/\\/g, '/');
+  if (!relative) return '.'; // a própria pasta da sessão
+  return (!relative.startsWith('..') && !path.isAbsolute(relative) ? relative : p).replace(/\\/g, '/');
+}
+
+/** " em pasta" das buscas; nada quando a busca é na própria pasta da sessão. */
+function inDir(session: AgentSession, p: unknown): string {
+  const where = rel(session, p);
+  return where && where !== '.' ? ` em ${where}` : '';
 }
 
 function clip(text: string, max: number): string {
@@ -178,9 +201,9 @@ function summarizeTool(session: AgentSession, name: string, input: Record<string
     case 'PowerShell':
       return { text: input.description ? String(input.description) : 'Rodou um comando', detail: clip(String(input.command ?? ''), 2000) };
     case 'Glob':
-      return { text: `Buscou arquivos ${input.pattern}${input.path ? ` em ${rel(session, input.path)}` : ''}` };
+      return { text: `Buscou arquivos ${input.pattern}${inDir(session, input.path)}` };
     case 'Grep':
-      return { text: `Procurou "${clip(String(input.pattern), 80)}"${input.path ? ` em ${rel(session, input.path)}` : ''}` };
+      return { text: `Procurou "${clip(String(input.pattern), 80)}"${inDir(session, input.path)}` };
     case 'WebFetch':
       return { text: `Abriu ${input.url}` };
     case 'WebSearch':
@@ -211,14 +234,50 @@ function resultText(content: unknown): string {
   return '';
 }
 
+/** Nome do modo de permissão como aparece na interface ("default" é o antigo nome de "Perguntar"). */
+function permissionLabel(mode: unknown): string {
+  if (mode === 'default') return PERMISSION_LABEL.manual;
+  return PERMISSION_LABEL[mode as PermissionMode] ?? String(mode);
+}
+
+function usd(value: number): string {
+  return value.toLocaleString('pt-BR', { style: 'currency', currency: 'USD' });
+}
+
+/** Por que a execução terminou com erro, em português e com o que fazer (em vez do código do CLI). */
+function resultError(session: AgentSession, event: any): string {
+  if (typeof event.result === 'string' && event.result.trim()) return event.result;
+  const details = Array.isArray(event.errors) ? event.errors.filter((e: unknown) => typeof e === 'string' && e.trim()).join('\n') : '';
+  switch (event.subtype) {
+    case 'error_max_turns':
+      return 'O Claude atingiu o limite de turnos desta execução. Responda para ele continuar de onde parou.';
+    case 'error_max_budget_usd':
+      return session.maxBudgetUsd
+        ? `O Claude parou ao atingir o limite de gasto desta execução (${usd(session.maxBudgetUsd)}). Responda para ele continuar: cada resposta tem um novo limite de ${usd(session.maxBudgetUsd)}.`
+        : 'O Claude parou ao atingir o limite de gasto desta execução. Responda para ele continuar.';
+    case 'error_during_execution':
+      return `O Claude Code falhou durante a execução.${details ? `\n${details}` : ' Responda para tentar de novo.'}`;
+    case 'error_max_structured_output_retries':
+      return 'O Claude não conseguiu montar a resposta no formato pedido.';
+    default:
+      return details || 'O Claude Code encerrou a execução com erro.';
+  }
+}
+
 /** Converte uma linha do stream-json do Claude Code em atividades. */
 function handleEvent(session: AgentSession, run: Run | null, event: any): void {
   if (!db.sessions.includes(session)) return; // workspace/issue apagado durante a execução
   if (event.type === 'system' && event.subtype === 'init') {
+    // Num ramo novo da conversa (--fork-session) o Claude Code cria outro ID: as próximas mensagens seguem nele.
+    if (typeof event.session_id === 'string' && event.session_id && event.session_id !== session.claudeSessionId) {
+      session.claudeSessionId = event.session_id;
+      // Só agora a sessão sai da conversa do terminal: se a execução caísse antes deste evento, a próxima resposta abriria um ramo novo de novo.
+      if (session.mode === 'terminal') session.mode = 'headless';
+    }
     // O modelo escolhido (ex.: "opus" ou o padrão da conta) continua em session.model; aqui fica o que rodou de fato.
     session.activeModel = event.model ?? null;
-    const effort = session.effort ? ` · effort ${session.effort}` : '';
-    emit(session, { type: 'system', text: `Sessão iniciada · ${event.model ?? 'modelo padrão'}${effort} · ${event.permissionMode ?? session.permissionMode}` });
+    const effort = session.effort ? ` · esforço ${EFFORT_LABEL[session.effort].toLowerCase()}` : '';
+    emit(session, { type: 'system', text: `Sessão iniciada · ${event.model ?? 'modelo padrão'}${effort} · ${permissionLabel(event.permissionMode ?? session.permissionMode)}` });
     commitSession(session);
     return;
   }
@@ -260,7 +319,6 @@ function handleEvent(session: AgentSession, run: Run | null, event: any): void {
   }
 
   if (event.type === 'result') {
-    if (run) run.gotResult = true;
     session.costUsd += Number(event.total_cost_usd ?? 0);
     session.durationMs += Number(event.duration_ms ?? 0);
     session.turns += Number(event.num_turns ?? 0);
@@ -274,8 +332,8 @@ function handleEvent(session: AgentSession, run: Run | null, event: any): void {
     const failed = event.is_error || (event.subtype && event.subtype !== 'success');
     if (failed) {
       session.state = 'error';
-      session.lastError = typeof event.result === 'string' && event.result ? event.result : `Execução terminou com "${event.subtype}".`;
-      emit(session, { type: 'error', text: session.lastError ?? 'Erro' });
+      session.lastError = resultError(session, event);
+      emit(session, { type: 'error', text: session.lastError });
     } else {
       const text = typeof event.result === 'string' ? event.result : '';
       // O texto final repete a última mensagem: promovemos essa mensagem a "resposta".
@@ -290,26 +348,42 @@ function handleEvent(session: AgentSession, run: Run | null, event: any): void {
     session.endedAt = now();
     commitSession(session);
     onSessionSettled(session);
+    // Só agora: se algo acima falhar, o 'close' ainda encerra a sessão com erro em vez de deixá-la "trabalhando".
+    if (run) run.gotResult = true;
   }
 }
 
 /** Automação de status no estilo Linear: delegar → Em andamento; agente terminou → Em revisão. */
 function onSessionSettled(session: AgentSession): void {
+  void refreshTouchedRepos(session).catch((error: unknown) => console.error('[octo] falha ao atualizar os repositórios da sessão', error));
   const issue = session.issueId ? db.issues.find((i) => i.id === session.issueId) : null;
   if (!issue) return;
   const account = db.accounts.find((a) => a.id === session.accountId);
   const actor = account?.name ?? 'Claude';
+  // Outra sessão desta issue ainda trabalha em segundo plano: a revisão espera ela terminar.
+  const othersRunning = db.sessions.some((s) => s !== session && s.issueId === issue.id && working(s.id));
   if (session.state === 'complete') {
-    if (issue.status === 'in_progress') {
+    if (issue.status === 'in_progress' && !othersRunning) {
       issue.status = 'in_review';
       addHistory(issue, 'status', actor, 'moveu para Em revisão ao concluir a sessão');
     } else {
-      addHistory(issue, 'session', actor, 'concluiu a sessão');
+      addHistory(issue, 'session', actor, othersRunning ? 'concluiu a sessão (outra sessão desta issue ainda está rodando)' : 'concluiu a sessão');
     }
-  } else if (session.state === 'awaiting_input') {
-    addHistory(issue, 'session', actor, `aguarda permissão para ${session.pendingDenials.length} ação(ões)`);
-  } else if (session.state === 'error') {
-    addHistory(issue, 'session', actor, 'encerrou a sessão com erro');
+    issue.reviewPending = othersRunning && issue.status === 'in_progress';
+  } else {
+    if (session.state === 'awaiting_input') {
+      addHistory(issue, 'session', actor, session.pendingDenials.length === 1 ? 'aguarda permissão para 1 ação' : `aguarda permissão para ${session.pendingDenials.length} ações`);
+    } else if (session.state === 'error') {
+      addHistory(issue, 'session', actor, 'encerrou a sessão com erro');
+    }
+    // Revisão adiada (outra sessão concluiu enquanto esta rodava): esta era a última, termine como terminar.
+    if (issue.reviewPending && !othersRunning) {
+      issue.reviewPending = false;
+      if (issue.status === 'in_progress') {
+        issue.status = 'in_review';
+        addHistory(issue, 'status', actor, 'moveu para Em revisão (outra sessão desta issue já tinha concluído)');
+      }
+    }
   }
   commitIssue(issue);
 }
@@ -366,33 +440,61 @@ function markDelegated(issue: Issue, account: ClaudeAccount, how: string): void 
   commitIssue(issue);
 }
 
+function missingFolder(cwd: string): string {
+  return `A pasta desta sessão não existe mais: ${cwd}. Ela pode ter sido movida, renomeada ou apagada; reescaneie o workspace.`;
+}
+
+/** Sessão que já existe: a pasta dela é fixa desde o início, então reescanear o workspace não resolve. */
+function missingSessionFolder(cwd: string): string {
+  return `A pasta desta sessão não existe mais: ${cwd}. Ela pode ter sido movida, renomeada ou apagada. Para continuar esta conversa, devolva a pasta a esse caminho; se não der, comece uma nova sessão.`;
+}
+
 export function startHeadless(options: StartOptions): AgentSession {
-  requireClaude(); // falha antes de registrar a sessão ou mexer no status da issue
+  // Tudo que pode falhar vem antes de registrar a sessão ou mexer no status da issue.
+  const claude = requireClaude();
   const session = createSession(options, 'headless');
-  db.sessions.push(session);
+  requireFolder(session.cwd, missingFolder(session.cwd));
   const repos = workspaceRepos(options.workspace.id);
   const prompt = options.issue ? issuePrompt(options.issue, repos, session.cwd, options.extraInstructions) : options.extraInstructions;
-  if (options.issue) markDelegated(options.issue, options.account, 'iniciou uma sessão em segundo plano');
+  const plan = planRun(
+    claude,
+    session,
+    prompt,
+    ['--session-id', session.claudeSessionId, '--name', session.title.slice(0, 80)],
+    [],
+    workspaceSystemPrompt(options.workspace, session.cwd),
+  );
 
-  const args = [
-    '--session-id', session.claudeSessionId,
-    '--name', session.title.slice(0, 80),
-    '--append-system-prompt', workspaceSystemPrompt(options.workspace, session.cwd),
-  ];
-  run(session, options.account, prompt, args, []);
+  db.sessions.push(session);
+  if (options.issue) markDelegated(options.issue, options.account, 'iniciou uma sessão em segundo plano');
+  void recordBaseline(session);
+  launchRun(session, options.account, plan);
   return session;
 }
 
 /** Continua a conversa; `changes` troca modelo, effort etc. a partir desta mensagem (como o /model do CLI). */
 export function sendMessage(session: AgentSession, text: string, allowedTools: string[], changes: Partial<SessionSettings> = {}): void {
-  if (runs.has(session.id)) throw new Error('A sessão ainda está em execução.');
+  if (runs.has(session.id)) throw new HttpError(409, 'A sessão ainda está em execução.');
+  if (opening.has(session.id)) throw new HttpError(409, 'A sessão está sendo aberta no terminal. Espere a janela abrir antes de responder por aqui.');
   const account = db.accounts.find((a) => a.id === session.accountId);
-  if (!account) throw new Error('A conta desta sessão foi removida.');
-  requireClaude();
+  if (!account) throw new HttpError(400, 'A conta desta sessão foi removida.');
+  const claude = requireClaude();
+  requireFolder(session.cwd, missingSessionFolder(session.cwd));
+  // Aberta no terminal (mesmo se já marcada como concluída): a janela pode continuar aberta nesta
+  // mesma conversa, e dois processos gravando o mesmo histórico o embaralham. Em segundo plano, a
+  // conversa segue num ramo novo (--fork-session), com todo o histórico; o ID novo chega no evento de início.
+  const fork = session.mode === 'terminal';
+  const plan = planRun(claude, { ...session, ...changes }, text, ['--resume', session.claudeSessionId, ...(fork ? ['--fork-session'] : [])], allowedTools, null);
+
   Object.assign(session, changes);
-  if (session.mode === 'terminal') session.mode = 'headless';
   session.pendingDenials = [];
-  run(session, account, text, ['--resume', session.claudeSessionId], allowedTools);
+  if (fork) {
+    emit(session, {
+      type: 'system',
+      text: 'Continuando em segundo plano numa cópia desta conversa. Se a janela do terminal ainda estiver aberta, ela segue com a conversa original.',
+    });
+  }
+  launchRun(session, account, plan);
 }
 
 /** As configurações da sessão como flags do `claude`. */
@@ -410,35 +512,81 @@ function settingsArgs(session: AgentSession, print: boolean): string[] {
   return args;
 }
 
-function run(session: AgentSession, account: ClaudeAccount, prompt: string, extraArgs: string[], allowedTools: string[]): void {
-  const claude = requireClaude();
-  const args = [
-    ...claude.prefixArgs,
-    '-p',
-    '--output-format', 'stream-json',
-    '--verbose',
-    ...settingsArgs(session, true),
-    ...extraArgs,
-  ];
-  if (allowedTools.length) args.push('--allowedTools', ...allowedTools);
+/** Uma execução em segundo plano já montada e validada, pronta para iniciar. */
+interface RunPlan {
+  command: string;
+  args: string[];
+  /** O que vai pelo stdin: o prompt (com o contexto do workspace, se ele não coube na linha de comando). */
+  input: string;
+  /** O prompt como aparece no feed. */
+  prompt: string;
+  allowedTools: string[];
+}
 
-  emit(session, { type: 'prompt', text: prompt, detail: allowedTools.length ? `Permitido: ${allowedTools.join(', ')}` : undefined });
+/**
+ * Monta os argumentos e confere o limite da linha de comando do sistema (32.767 caracteres no
+ * Windows) antes de qualquer mudança de estado. O contexto do workspace vai no system prompt;
+ * se não couber (ex.: diretrizes muito longas), segue junto do prompt pelo stdin, que não tem limite.
+ */
+function planRun(claude: ClaudeCommand, session: AgentSession, prompt: string, extraArgs: string[], allowedTools: string[], context: string | null): RunPlan {
+  const base = [...claude.prefixArgs, '-p', '--output-format', 'stream-json', '--verbose', ...settingsArgs(session, true), ...extraArgs];
+  // --allowedTools aceita vários valores: fica por último.
+  const tools = allowedTools.length ? ['--allowedTools', ...allowedTools] : [];
+  const plan = { command: claude.command, prompt, allowedTools };
+  if (context) {
+    const args = [...base, '--append-system-prompt', context, ...tools];
+    if (fitsCommandLine(claude.command, args)) return { ...plan, args, input: prompt };
+  }
+  const args = [...base, ...tools];
+  if (!fitsCommandLine(claude.command, args)) {
+    throw new HttpError(400, 'As ações liberadas formam um comando longo demais para o sistema. Libere menos ações de uma vez, ou responda sem liberar.');
+  }
+  return { ...plan, args, input: context ? `${context}\n\n---\n\n${prompt}` : prompt };
+}
+
+/** Exceções aqui (num evento do processo) derrubariam o servidor: viram só um registro no console. */
+function guarded(action: () => void): void {
+  try {
+    action();
+  } catch (error) {
+    console.error('[octo]', error);
+  }
+}
+
+function launchRun(session: AgentSession, account: ClaudeAccount, plan: RunPlan): void {
+  emit(session, { type: 'prompt', text: plan.prompt, detail: plan.allowedTools.length ? `Permitido: ${plan.allowedTools.join(', ')}` : undefined });
   session.state = 'active';
   session.endedAt = null;
   session.lastError = null;
   commitSession(session);
 
-  const child = spawn(claude.command, args, {
-    cwd: session.cwd,
-    env: claudeEnv(account),
-    windowsHide: true,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  const state: Run = { child, stopped: false, gotResult: false, stderr: '', lastMessage: null };
+  let child: ChildProcess;
+  try {
+    child = spawn(plan.command, plan.args, {
+      cwd: session.cwd,
+      env: claudeEnv(account),
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    // Algumas falhas (executável inválido, linha de comando longa demais) são lançadas aqui,
+    // sem evento 'error' nem 'close': sem isto a sessão ficaria "trabalhando" sem processo.
+    session.state = 'error';
+    session.endedAt = now();
+    session.lastError = describeSpawnError(error, 'Não foi possível iniciar o Claude Code');
+    emit(session, { type: 'error', text: session.lastError });
+    commitSession(session);
+    onSessionSettled(session);
+    return;
+  }
+  const state: Run = { child, stopped: false, gotResult: false, stderr: '', lastMessage: null, killTimer: null };
   runs.set(session.id, state);
 
+  // Se o Claude sair antes de ler tudo (ex.: uma opção que a versão instalada não conhece, ou o
+  // Parar logo no início), a escrita falha com EPIPE/EOF. O desfecho já vem pelo 'close'.
+  child.stdin?.on('error', () => {});
   // O prompt vai pelo stdin: sem limite de tamanho de linha de comando e sem problemas de escape.
-  child.stdin?.end(prompt);
+  child.stdin?.end(plan.input);
 
   createInterface({ input: child.stdout! }).on('line', (line) => {
     if (!line.trim()) return;
@@ -451,11 +599,12 @@ function run(session: AgentSession, account: ClaudeAccount, prompt: string, extr
   child.stderr?.on('data', (chunk) => {
     state.stderr = (state.stderr + chunk.toString()).slice(-4000);
   });
-  child.on('error', (error) => finish(session, state, null, error.message));
-  child.on('close', (code) => finish(session, state, code, null));
+  child.on('error', (error) => guarded(() => finish(session, state, null, describeSpawnError(error, 'Não foi possível iniciar o Claude Code'))));
+  child.on('close', (code) => guarded(() => finish(session, state, code, null)));
 }
 
 function finish(session: AgentSession, state: Run, code: number | null, spawnError: string | null): void {
+  if (state.killTimer) clearTimeout(state.killTimer);
   if (runs.get(session.id) !== state) return;
   runs.delete(session.id);
   if (state.gotResult || !db.sessions.includes(session)) return;
@@ -465,7 +614,10 @@ function finish(session: AgentSession, state: Run, code: number | null, spawnErr
     emit(session, { type: 'system', text: 'Sessão interrompida por você.' });
   } else {
     session.state = 'error';
-    session.lastError = spawnError ?? (state.stderr.trim().split('\n').slice(-6).join('\n') || `Claude Code saiu com código ${code}.`);
+    const stderr = state.stderr.trim().split('\n').slice(-6).join('\n');
+    session.lastError =
+      spawnError ??
+      (stderr ? `O Claude Code parou com erro:\n${stderr}` : `O Claude Code foi encerrado antes de concluir (código de saída ${code ?? 'desconhecido'}).`);
     emit(session, { type: 'error', text: session.lastError });
   }
   commitSession(session);
@@ -473,22 +625,53 @@ function finish(session: AgentSession, state: Run, code: number | null, spawnErr
 }
 
 /**
- * "Concluir assim mesmo": o agente terminou, mas alguma ação foi bloqueada no caminho e ele
- * resolveu sem ela. A sessão vira concluída (e a issue vai para revisão) sem liberar nada.
+ * "Concluir assim mesmo": o agente terminou (ou parou com erro, ex.: no limite de gasto), mas
+ * alguma ação foi bloqueada no caminho. A sessão vira concluída (e a issue vai para revisão) sem liberar nada.
  */
 export function dismissDenials(session: AgentSession): void {
-  if (runs.has(session.id)) throw new Error('A sessão ainda está em execução.');
-  if (session.state !== 'awaiting_input') return;
+  if (runs.has(session.id)) throw new HttpError(409, 'A sessão ainda está em execução.');
+  // O resultado com erro também traz as ações bloqueadas.
+  if (!session.pendingDenials.length || (session.state !== 'awaiting_input' && session.state !== 'error')) {
+    throw new HttpError(409, 'Esta sessão não tem ações bloqueadas para dispensar.');
+  }
   session.pendingDenials = [];
   session.state = 'complete';
+  session.endedAt = now();
+  session.lastError = null;
   emit(session, { type: 'system', text: 'Concluída sem liberar as ações bloqueadas.' });
+  commitSession(session);
+  onSessionSettled(session);
+}
+
+/**
+ * "Concluir": encerra uma sessão que o Octo não acompanha até o fim (aberta no terminal) ou que
+ * aguarda permissão. A sessão vira concluída e a issue em andamento vai para revisão.
+ */
+export function finishSession(session: AgentSession): void {
+  if (runs.has(session.id)) throw new HttpError(400, 'A sessão está rodando em segundo plano. Pare-a antes de concluir.');
+  if (session.state === 'complete') return;
+  const hadDenials = session.pendingDenials.length > 0;
+  session.pendingDenials = [];
+  session.state = 'complete';
+  session.endedAt = now();
+  session.lastError = null;
+  emit(session, { type: 'system', text: hadDenials ? 'Concluída por você, sem liberar as ações bloqueadas.' : 'Sessão concluída por você.' });
   commitSession(session);
   onSessionSettled(session);
 }
 
 export function stopSession(session: AgentSession): void {
   const state = runs.get(session.id);
-  if (!state) return;
+  if (!state) {
+    // Sem processo (ex.: o início falhou ou o Octo reiniciou): a sessão não pode ficar "trabalhando".
+    if (session.state === 'active' || session.state === 'pending') {
+      session.state = 'stopped';
+      session.endedAt = now();
+      emit(session, { type: 'system', text: 'Sessão interrompida por você.' });
+      commitSession(session);
+    }
+    return;
+  }
   state.stopped = true;
   const pid = state.child.pid;
   if (process.platform === 'win32' && pid) {
@@ -496,55 +679,173 @@ export function stopSession(session: AgentSession): void {
     spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
   } else {
     state.child.kill('SIGTERM');
+    // Se o Claude não sair sozinho em alguns segundos, força (o Parar não pode ficar sem efeito).
+    if (!state.killTimer) {
+      state.killTimer = setTimeout(() => {
+        if (runs.get(session.id) === state) state.child.kill('SIGKILL');
+      }, 5000);
+      state.killTimer.unref();
+    }
   }
 }
 
 // ---------------------------------------------------------------- terminal interativo
 
-export function startInTerminal(options: StartOptions): AgentSession {
+const PROMPT_CUT = '\n\n[Octo: o restante da descrição foi cortado aqui por causa do limite de tamanho da linha de comando do sistema. Se precisar dele, peça ao usuário.]';
+const CONTEXT_CUT = '\n\n[Octo: o restante do contexto do workspace foi cortado por causa do limite de tamanho da linha de comando do sistema.]';
+
+/**
+ * No terminal o prompt e o contexto vão na linha de comando do Claude (32.767 caracteres no
+ * Windows, 128 KiB por argumento no Linux). Se passar, corta o fim da descrição (e, se ainda
+ * faltar espaço, o do contexto) com um aviso, em vez de o Claude nem abrir. Diz o que foi cortado.
+ */
+function fitTerminalArgs(claude: ClaudeCommand, options: string[], context: string, prompt: string): { args: string[]; promptCut: boolean; contextCut: boolean } {
+  // "--" encerra as opções: um prompt que começa com "-" (ex.: uma lista) continua sendo o prompt.
+  const build = (system: string, text: string) => [...options, '--append-system-prompt', system, ...(text.trim() ? ['--', text] : [])];
+  const full = (args: string[]) => [...claude.prefixArgs, ...args];
+  if (fitsCommandLine(claude.command, full(build(context, prompt)))) return { args: build(context, prompt), promptCut: false, contextCut: false };
+  // Primeiro o fim da descrição, mantendo pelo menos o começo dela.
+  const keep = Math.min(prompt.length, 2000);
+  const shortPrompt = shrinkToFit(claude.command, (text) => full(build(context, text)), prompt, PROMPT_CUT, keep);
+  if (shortPrompt !== null) return { args: build(context, shortPrompt), promptCut: true, contextCut: false };
+  // Descrição curta (ou já no mínimo): o que passa do limite é o contexto do workspace.
+  const head = keep < prompt.length ? prompt.slice(0, keep) + PROMPT_CUT : prompt;
+  const shortContext = shrinkToFit(claude.command, (system) => full(build(system, head)), context, CONTEXT_CUT);
+  if (shortContext !== null) return { args: build(shortContext, head), promptCut: head !== prompt, contextCut: shortContext !== context };
+  throw new HttpError(400, 'O comando para abrir o Claude ficou longo demais para o sistema. Encurte as diretrizes do workspace ou use “Delegar” em segundo plano.');
+}
+
+export async function startInTerminal(options: StartOptions): Promise<AgentSession> {
+  const claude = requireClaude();
   const session = createSession(options, 'terminal');
+  requireFolder(session.cwd, missingFolder(session.cwd));
   const repos = workspaceRepos(options.workspace.id);
   const prompt = options.issue ? issuePrompt(options.issue, repos, session.cwd, options.extraInstructions) : options.extraInstructions;
+  const { args, promptCut, contextCut } = fitTerminalArgs(
+    claude,
+    [...settingsArgs(session, false), '--session-id', session.claudeSessionId, '--name', session.title.slice(0, 80)],
+    workspaceSystemPrompt(options.workspace, session.cwd),
+    prompt,
+  );
+  const warnings = [
+    promptCut ? '\nAtenção: a descrição da issue era longa demais para a linha de comando e foi cortada.' : '',
+    contextCut ? '\nAtenção: o contexto do workspace (repositórios e diretrizes) era longo demais para a linha de comando e foi cortado.' : '',
+  ].join('');
 
-  const args = [
-    ...settingsArgs(session, false),
-    '--session-id', session.claudeSessionId,
-    '--name', session.title.slice(0, 80),
-    '--append-system-prompt', workspaceSystemPrompt(options.workspace, session.cwd),
-  ];
-  // "--" encerra as opções: um prompt que começa com "-" (ex.: uma lista) continua sendo o prompt.
-  if (prompt.trim()) args.push('--', prompt);
-
-  openClaudeTerminal({
+  await openClaudeTerminal({
     cwd: session.cwd,
     account: options.account,
     args,
     title: `Octo · ${session.title}`,
-    banner: `Octo · ${options.account.name} · ${session.cwd}`,
+    banner: `Octo · ${options.account.name} · ${session.cwd}${warnings}`,
   });
   // Só registra depois que o terminal abriu de fato.
   db.sessions.push(session);
   if (options.issue) markDelegated(options.issue, options.account, 'abriu uma sessão no terminal');
   emit(session, { type: 'prompt', text: prompt || '_Sessão interativa aberta no terminal._' });
+  if (promptCut) {
+    emit(session, {
+      type: 'system',
+      text: 'A descrição passou do limite de tamanho da linha de comando do sistema e chegou cortada ao terminal. Para enviar o texto inteiro, use “Delegar” em segundo plano.',
+    });
+  }
+  if (contextCut) {
+    emit(session, {
+      type: 'system',
+      text: 'O contexto do workspace (repositórios e diretrizes) passou do limite de tamanho da linha de comando do sistema e chegou cortado ao terminal: o fim das diretrizes do workspace pode ter ficado de fora. Encurte as diretrizes, ou use “Delegar” em segundo plano, que envia tudo.',
+    });
+  }
   emit(session, { type: 'system', text: 'Aberta no terminal. Use "Sincronizar" para trazer o andamento para cá.' });
   commitSession(session);
+  void recordBaseline(session);
   return session;
 }
 
-export function resumeInTerminal(session: AgentSession): void {
-  if (runs.has(session.id)) throw new Error('Pare a execução em segundo plano antes de abrir no terminal.');
-  const account = db.accounts.find((a) => a.id === session.accountId) ?? null;
-  openClaudeTerminal({
-    cwd: session.cwd,
-    account,
-    args: ['--resume', session.claudeSessionId, ...settingsArgs(session, false)],
-    title: `Octo · ${session.title}`,
-    banner: `Octo · retomando ${session.title}`,
-  });
+export async function resumeInTerminal(session: AgentSession): Promise<void> {
+  if (runs.has(session.id)) throw new HttpError(409, 'Pare a execução em segundo plano antes de abrir no terminal.');
+  if (opening.has(session.id)) throw new HttpError(409, 'A sessão já está sendo aberta no terminal.');
+  const account = db.accounts.find((a) => a.id === session.accountId);
+  if (!account) throw new HttpError(400, 'A conta desta sessão foi removida.');
+  requireFolder(session.cwd, missingSessionFolder(session.cwd));
+  // Enquanto a janela abre (no iTerm, até a permissão de Automação), uma resposta por aqui rodaria
+  // em segundo plano na mesma conversa que o terminal vai retomar: sendMessage recusa.
+  opening.add(session.id);
+  try {
+    await openClaudeTerminal({
+      cwd: session.cwd,
+      account,
+      args: ['--resume', session.claudeSessionId, ...settingsArgs(session, false)],
+      title: `Octo · ${session.title}`,
+      banner: `Octo · retomando ${session.title}`,
+    });
+  } finally {
+    opening.delete(session.id);
+  }
   session.mode = 'terminal';
   session.state = 'terminal';
+  // No terminal o Claude pergunta na hora: as ações bloqueadas em segundo plano não valem mais.
+  session.pendingDenials = [];
   emit(session, { type: 'system', text: 'Sessão retomada no terminal.' });
   commitSession(session);
+}
+
+// ---------------------------------------------------------------- depois da sessão
+
+/** Repositórios cujo estado inicial importa para a aba Mudanças: os da issue primeiro, depois os da pasta. */
+function baselineRepos(session: AgentSession): Repo[] {
+  const issue = session.issueId ? db.issues.find((i) => i.id === session.issueId) : null;
+  const inScope = workspaceRepos(session.workspaceId).filter((r) => isInside(session.cwd, r.absPath));
+  const focused = inScope.filter((r) => issue?.repoIds.includes(r.id));
+  return [...new Set([...focused, ...inScope])].slice(0, 40);
+}
+
+/** Registra o que já estava alterado (sem commit) quando a sessão começou, para a aba Mudanças. */
+async function recordBaseline(session: AgentSession): Promise<void> {
+  try {
+    const at = now();
+    const repos = baselineRepos(session);
+    const entries: Record<string, string[]> = {};
+    for (let i = 0; i < repos.length; i += 4) {
+      const batch = repos.slice(i, i + 4);
+      const results = await Promise.all(batch.map((repo) => dirtyEntries(repo)));
+      batch.forEach((repo, index) => {
+        const result = results[index];
+        if (result) entries[repo.id] = result;
+      });
+    }
+    if (!db.sessions.includes(session)) return;
+    writeBaseline(session.id, { at, repos: entries });
+    session.baselineAt = at;
+    commitSession(session);
+  } catch (error) {
+    console.error('[octo] não foi possível registrar o estado inicial dos repositórios', error);
+  }
+}
+
+/**
+ * Depois de uma sessão, lê de novo os repositórios que ela mexeu (branch, alterações, último
+ * commit): a tela de Repositórios não fica mostrando "limpo" num repo que o agente acabou de editar.
+ */
+async function refreshTouchedRepos(session: AgentSession): Promise<void> {
+  const workspace = db.workspaces.find((w) => w.id === session.workspaceId);
+  if (!workspace) return;
+  const issue = session.issueId ? db.issues.find((i) => i.id === session.issueId) : null;
+  const ids = new Set([...session.touchedRepoIds, ...(issue?.repoIds ?? [])]);
+  const repos = workspaceRepos(workspace.id);
+  // Uma sessão no terminal só sabe o que mexeu depois de sincronizar: vale a pasta dela.
+  const targets = ids.size
+    ? repos.filter((r) => ids.has(r.id))
+    : session.mode === 'terminal'
+      ? repos.filter((r) => isInside(session.cwd, r.absPath)).slice(0, 40)
+      : [];
+  const dirs = targets.map((r) => r.absPath).filter((dir) => existsSync(dir));
+  if (!dirs.length) return;
+  const fresh = await describeRepos(workspace, dirs);
+  if (!db.workspaces.includes(workspace)) return;
+  const byId = new Map(fresh.map((repo) => [repo.id, repo]));
+  db.repos = db.repos.map((repo) => byId.get(repo.id) ?? repo);
+  save();
+  broadcast({ type: 'repos', workspaceId: workspace.id, repos: workspaceRepos(workspace.id) });
 }
 
 /** Lê o transcript que o Claude Code grava em <config>/projects/<pasta>/<id>.jsonl. */
