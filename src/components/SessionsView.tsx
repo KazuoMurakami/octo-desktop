@@ -1,12 +1,12 @@
 import { useMemo } from 'react';
-import { FolderOpen, Inbox, SquareTerminal } from 'lucide-react';
+import { FolderOpen, GitBranch, Inbox, SquareTerminal } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { openClaudeIn } from '../integrations.ts';
 import { useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { ago, money } from '../util.ts';
+import { sessionFolderLabel, worktreeBranch } from '../worktree.ts';
 import { Cost, usesSubscription } from './AccountsView.tsx';
 import { AccountAvatar, OrbitMark, SessionBadge } from './icons.tsx';
-import { folderLabel } from './OpenMenu.tsx';
 import { RepoChip } from './ui.tsx';
 
 /** Visão geral do trabalho dos agentes — equivalente às páginas de agente do Linear. */
@@ -79,7 +79,10 @@ export function SessionsView() {
                     <span>{issue?.title ?? session.title}</span>
                   </div>
                   <div className="session-sub">
-                    <span className="mono with-icon"><FolderOpen size={12} /> {workspace ? folderLabel(workspace, session.cwd) : session.cwd}</span>
+                    <span className="mono with-icon" title={session.worktree ? `${session.cwd} · branch ${worktreeBranch(session.worktree)}` : session.cwd}>
+                      {session.worktree ? <GitBranch size={12} /> : <FolderOpen size={12} />}{' '}
+                      {workspace ? sessionFolderLabel(workspace, session.cwd, session.worktree) : session.cwd}
+                    </span>
                     <span>{session.mode === 'terminal' ? 'terminal' : 'segundo plano'}</span>
                     {touched.slice(0, 4).map((r) => <RepoChip key={r.id} repo={r} lit />)}
                   </div>

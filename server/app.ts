@@ -7,15 +7,16 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import {
-  EFFORTS, PERMISSION_MODES, STATUSES, STATUS_LABEL,
+  EFFORTS, MAX_IMAGES_TOTAL_BASE64, PERMISSION_MODES, STATUSES, STATUS_LABEL,
   type AccountStatus, type AppState, type ClaudeAccount, type Effort, type Issue, type IssueStatus, type PermissionMode, type Priority,
-  type Repo, type SessionSettings, type Workspace,
+  type Repo, type SessionSettings, type Workspace, type WorktreeBase,
 } from '../shared/types.ts';
 import {
-  dismissDenials, finishSession, isInside, isRunning, resumeInTerminal, sendMessage, sessionActivities, startHeadless, startInTerminal, stopSession,
-  syncFromTranscript,
+  dismissDenials, finishSession, isInside, isRunning, isWorking, refuseTerminalImages, resumeInTerminal, sendMessage, sessionActivities, settleRun,
+  startHeadless,
+  startInTerminal, stopSession, syncFromTranscript,
 } from './agent.ts';
-import { checkAccountStatus, claude } from './claude.ts';
+import { checkAccountStatus, claude, requireClaude } from './claude.ts';
 import {
   addMcpServer, availablePlugins, copyItem, createItem, deleteItem, patchSettings, pluginAction, readAccountConfig, readItem, removeMcpServer,
   saveItem, writeSettingsRaw,
@@ -23,6 +24,7 @@ import {
 import { changesFor, markPreexisting } from './changes.ts';
 import { readContextStatus, renderContextBlock, writeContext } from './context.ts';
 import { broadcast, subscribe } from './events.ts';
+import { imageFile, parseImages, saveImages } from './images.ts';
 import {
   HttpError, addHistory, commitIssue, getAccount, getIssue, getSession, getWorkspace, now, requireFolder, workspaceRepos,
 } from './model.ts';
@@ -33,6 +35,9 @@ import { checkUpdate } from './update.ts';
 import { DATA_DIR, db, dbNotice, flush, readBaseline, save } from './store.ts';
 import { copyTree, samePath } from './system.ts';
 import { openClaudeTerminal, openShell, pickFolder, revealFolder } from './terminal.ts';
+import {
+  WORKTREES_DIR, discardNewWorktree, isPreparing, planWorktree, prepareWorktree, removeWorktree, reposAt, sessionRepos, worktreeAt, worktreeStatus,
+} from './worktrees.ts';
 
 // server/ no código-fonte, dist-electron/ no app empacotado: a raiz é sempre um nível acima.
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -119,6 +124,11 @@ function asEffort(value: unknown): Effort | null {
   return EFFORTS.includes(value as Effort) ? (value as Effort) : null;
 }
 
+/** De onde sai a branch do worktree pedido ao delegar; null (ou qualquer outro valor) = sem worktree. */
+function asWorktreeBase(value: unknown): WorktreeBase | null {
+  return value === 'default' || value === 'current' ? value : null;
+}
+
 /** Modelo ou agente que vai como argumento do `claude` ('' = padrão). Nunca começa com "-". */
 function cliValue(value: unknown, what: string): string | null {
   const text = str(value).trim();
@@ -202,12 +212,13 @@ function settingsChanges(body: Record<string, unknown>): Partial<SessionSettings
   return changes;
 }
 
-/** Pasta de projeto para listar skills/agentes em .claude/: precisa estar dentro de um workspace. */
+/** Pasta de projeto para listar skills/agentes em .claude/: precisa estar dentro de um workspace ou de um worktree do Octo. */
 function projectDir(value: unknown): string | null {
   const dir = str(value).trim();
   if (!dir) return null;
   const resolved = path.resolve(dir);
-  return db.workspaces.some((w) => isInside(w.rootPath, resolved)) && existsSync(resolved) ? resolved : null;
+  const known = db.workspaces.some((w) => isInside(w.rootPath, resolved)) || isInside(WORKTREES_DIR, resolved);
+  return known && existsSync(resolved) ? resolved : null;
 }
 
 async function rescan(workspace: Workspace) {
@@ -253,7 +264,22 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.json({ limit: '2mb' }));
+
+/**
+ * Rotas que recebem imagens (as que usam imageJson): o corpo delas é lido na própria rota, depois do
+ * token e com um limite maior. As demais leem o corpo aqui, com até 2 MB.
+ */
+const IMAGE_ROUTE = /^\/api\/(sessions\/[^/]+\/message|issues\/[^/]+\/delegate)\/?$/i;
+
+function takesImages(req: Request): boolean {
+  return req.method === 'POST' && IMAGE_ROUTE.test(req.path);
+}
+
+const json = express.json({ limit: '2mb' });
+app.use((req, res, next) => (takesImages(req) ? next() : json(req, res, next)));
+
+/** Corpo das rotas com imagens: as imagens (até MAX_IMAGES_TOTAL_BASE64 somadas), mais 2 MB para o texto e as opções. */
+const imageJson = express.json({ limit: MAX_IMAGES_TOTAL_BASE64 + 2 * 1024 * 1024 });
 
 function cookieName(): string {
   return `octo_${listeningPort}`;
@@ -354,6 +380,7 @@ app.post('/api/workspaces', async (req, res) => {
     defaultPermissionMode: 'acceptEdits',
     defaultModel: null,
     defaultEffort: null,
+    defaultWorktree: false,
     createdAt: now(),
     scannedAt: null,
   };
@@ -373,6 +400,7 @@ app.patch('/api/workspaces/:id', async (req, res) => {
   if (asPermission(body.defaultPermissionMode)) workspace.defaultPermissionMode = asPermission(body.defaultPermissionMode)!;
   if (body.defaultModel !== undefined) workspace.defaultModel = cliValue(body.defaultModel, 'Modelo');
   if (body.defaultEffort !== undefined) workspace.defaultEffort = asEffort(body.defaultEffort);
+  if (typeof body.defaultWorktree === 'boolean') workspace.defaultWorktree = body.defaultWorktree;
   let depthChanged = false;
   if (body.scanDepth !== undefined) {
     const depth = Math.min(Math.max(Number(body.scanDepth) || 3, 1), 6);
@@ -388,6 +416,14 @@ app.patch('/api/workspaces/:id', async (req, res) => {
 
 app.delete('/api/workspaces/:id', (req, res) => {
   const workspace = getWorkspace(req.params.id);
+  // Sem o workspace, nada no Octo removeria os worktrees das issues: as branches ficariam presas em pastas sem dono.
+  const withWorktree = db.issues.filter((i) => i.workspaceId === workspace.id && (i.worktree || isPreparing(i.id)));
+  if (withWorktree.length) {
+    throw new HttpError(
+      409,
+      `Remova antes os worktrees das issues ${withWorktree.map((i) => i.identifier).join(', ')} (no painel de cada uma, Mais ações → Remover worktree…). As branches continuam nos repositórios.`,
+    );
+  }
   for (const session of db.sessions) if (session.workspaceId === workspace.id && isRunning(session.id)) stopSession(session);
   db.workspaces = db.workspaces.filter((w) => w.id !== workspace.id);
   db.repos = db.repos.filter((r) => r.workspaceId !== workspace.id);
@@ -406,21 +442,25 @@ app.post('/api/workspaces/:id/scan', async (req, res) => {
 app.get('/api/workspaces/:id/context', (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const dir = folderIn(workspace, req.query.dir);
-  const repos = workspaceRepos(workspace.id).filter((r) => isInside(dir, r.absPath));
+  const repos = reposAt(workspace, dir).filter((r) => isInside(dir, r.absPath));
   res.json({ ...readContextStatus(dir), preview: renderContextBlock(workspace, dir, repos) });
 });
 
 app.post('/api/workspaces/:id/context', (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const dir = folderIn(workspace, req.body.dir);
-  const repos = workspaceRepos(workspace.id).filter((r) => isInside(dir, r.absPath));
+  const repos = reposAt(workspace, dir).filter((r) => isInside(dir, r.absPath));
   res.json({ file: writeContext(workspace, dir, repos) });
 });
 
-/** Pasta dentro do workspace (raiz, pasta de grupo ou repo) enviada pela interface. */
+/**
+ * Pasta dentro do workspace (raiz, pasta de grupo ou repo) enviada pela interface. Vale também uma
+ * pasta de um worktree do workspace (o de uma issue ou o de uma sessão), que fica fora dele.
+ */
 function folderIn(workspace: Workspace, value: unknown): string {
   const dir = typeof value === 'string' && value ? path.resolve(value) : workspace.rootPath;
-  if (!isInside(workspace.rootPath, dir) || !existsSync(dir)) throw new HttpError(400, 'Pasta fora do workspace.');
+  const inside = isInside(workspace.rootPath, dir) || worktreeAt(workspace, dir) !== null;
+  if (!inside || !existsSync(dir)) throw new HttpError(400, 'Pasta fora do workspace.');
   return dir;
 }
 
@@ -428,7 +468,9 @@ function folderIn(workspace: Workspace, value: unknown): string {
 app.post('/api/workspaces/:id/terminal', async (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const options = workspaceTerminalOptions(workspace, req.body);
-  res.json(await startInTerminal({ ...options, issue: null, cwd: folderIn(workspace, req.body.dir) }));
+  const cwd = folderIn(workspace, req.body.dir);
+  // Numa pasta de worktree, o Claude recebe o contexto dele: os repositórios nos caminhos do worktree e as regras.
+  res.json(await startInTerminal({ ...options, issue: null, cwd, worktree: worktreeAt(workspace, cwd) }));
 });
 
 // ---------------------------------------------------------------- editores, terminal e mudanças
@@ -459,10 +501,13 @@ app.patch('/api/preferences', (req, res) => {
   res.json(integrations());
 });
 
-/** Repositórios que importam numa sessão: os que ela tocou e os da issue; senão, todos da pasta dela. */
-function sessionRepos(sessionId: string): { session: ReturnType<typeof getSession>; focused: Repo[]; inScope: Repo[] } {
+/**
+ * Repositórios que importam numa sessão: os que ela tocou e os da issue; senão, todos da pasta dela.
+ * Numa sessão em worktree, nos caminhos do worktree.
+ */
+function sessionScope(sessionId: string): { session: ReturnType<typeof getSession>; focused: Repo[]; inScope: Repo[] } {
   const session = getSession(sessionId);
-  const inScope = workspaceRepos(session.workspaceId).filter((r) => isInside(session.cwd, r.absPath));
+  const inScope = sessionRepos(session).filter((r) => isInside(session.cwd, r.absPath));
   const issue = session.issueId ? db.issues.find((i) => i.id === session.issueId) : null;
   const focused = inScope.filter((r) => session.touchedRepoIds.includes(r.id) || issue?.repoIds.includes(r.id));
   return { session, focused, inScope };
@@ -477,7 +522,7 @@ app.post('/api/workspaces/:id/open-editor', async (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const dir = folderIn(workspace, req.body.dir);
   const ids = Array.isArray(req.body.repoIds) ? new Set(req.body.repoIds.filter((id: unknown) => typeof id === 'string')) : null;
-  const repos = workspaceRepos(workspace.id).filter((r) => (ids ? ids.has(r.id) : isInside(dir, r.absPath)));
+  const repos = reposAt(workspace, dir).filter((r) => (ids ? ids.has(r.id) : isInside(dir, r.absPath)));
   const name = `${workspace.name}-${path.basename(dir)}`;
   res.json({ editor: await openInEditor({ editorId: str(req.body.editor) || null, name, dir, folders: editorFolders(dir, repos) }) });
 });
@@ -492,11 +537,11 @@ app.post('/api/workspaces/:id/shell', async (req, res) => {
 app.get('/api/workspaces/:id/changes', async (req, res) => {
   const workspace = getWorkspace(req.params.id);
   const dir = folderIn(workspace, req.query.dir);
-  res.json(await changesFor(workspaceRepos(workspace.id).filter((r) => isInside(dir, r.absPath)).slice(0, 40)));
+  res.json(await changesFor(reposAt(workspace, dir).filter((r) => isInside(dir, r.absPath)).slice(0, 40)));
 });
 
 app.post('/api/sessions/:id/open-editor', async (req, res) => {
-  const { session, focused, inScope } = sessionRepos(req.params.id);
+  const { session, focused, inScope } = sessionScope(req.params.id);
   const repos = focused.length ? focused : inScope;
   const name = `${path.basename(session.cwd)}-${session.id.slice(0, 8)}`;
   res.json({ editor: await openInEditor({ editorId: str(req.body.editor) || null, name, dir: session.cwd, folders: editorFolders(session.cwd, repos) }) });
@@ -510,7 +555,7 @@ app.post('/api/sessions/:id/shell', async (req, res) => {
 });
 
 app.get('/api/sessions/:id/changes', async (req, res) => {
-  const { session, focused, inScope } = sessionRepos(req.params.id);
+  const { session, focused, inScope } = sessionScope(req.params.id);
   const changes = await changesFor((focused.length ? focused : inScope).slice(0, 40));
   // Separa o que já estava alterado quando a sessão começou do que mudou durante ela.
   const baseline = readBaseline(session.id);
@@ -724,6 +769,7 @@ app.post('/api/workspaces/:id/issues', (req, res) => {
     repoIds: Array.isArray(req.body.repoIds) ? req.body.repoIds.filter((id: string) => repoIds.has(id)) : [],
     delegateAccountId: req.body.delegateAccountId ? getAccount(str(req.body.delegateAccountId)).id : null,
     reviewPending: false,
+    worktree: null,
     sortOrder: -Date.now(),
     createdAt: now(),
     updatedAt: now(),
@@ -771,6 +817,11 @@ app.patch('/api/issues/:id', (req, res) => {
 
 app.delete('/api/issues/:id', (req, res) => {
   const issue = getIssue(req.params.id);
+  // O worktree sai antes (a interface o remove ao excluir, e recusa se houver algo a perder): sem a issue, a branch ficaria presa numa pasta sem dono.
+  if (isPreparing(issue.id)) throw new HttpError(409, 'O worktree desta issue está sendo preparado. Espere a delegação terminar e tente de novo.');
+  if (issue.worktree) {
+    throw new HttpError(409, `Esta issue tem o worktree ${path.basename(issue.worktree.root)}. Remova-o antes, em Mais ações → Remover worktree…; as branches continuam nos repositórios.`);
+  }
   for (const session of db.sessions) if (session.issueId === issue.id && isRunning(session.id)) stopSession(session);
   db.issues = db.issues.filter((i) => i.id !== issue.id);
   save();
@@ -778,11 +829,65 @@ app.delete('/api/issues/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/issues/:id/delegate', async (req, res) => {
+app.post('/api/issues/:id/delegate', imageJson, async (req, res) => {
   const issue = getIssue(req.params.id);
   const workspace = getWorkspace(issue.workspaceId);
-  const options = { ...workspaceTerminalOptions(workspace, req.body), issue };
-  res.json(req.body.mode === 'terminal' ? await startInTerminal(options) : startHeadless(options));
+  const terminal = req.body.mode === 'terminal';
+  const base = asWorktreeBase(req.body.worktree);
+  // Antes de preparar o worktree, tudo que recusaria a delegação (conta, configurações, imagens, que só vão
+  // em segundo plano, e o Claude Code instalado): uma delegação recusada não deixa um worktree para trás.
+  const options = { ...workspaceTerminalOptions(workspace, req.body), issue, images: parseImages(req.body.images) };
+  if (terminal) refuseTerminalImages(options.images);
+  if (base) requireClaude();
+  // As imagens vão para o disco antes do worktree: se a gravação falhar, nenhum worktree fica para trás.
+  const sessionId = randomUUID();
+  const savedImages = saveImages(sessionId, options.images);
+  // Se a issue já tem um worktree, a sessão continua nele (a base só vale para um novo).
+  const hadWorktree = Boolean(issue.worktree);
+  const prepared = base ? await prepareWorktree(workspace, issue, base) : null;
+  const start = { ...options, sessionId, savedImages, worktree: prepared?.worktree ?? null, notes: prepared?.notes ?? [] };
+  try {
+    res.json(terminal ? await startInTerminal(start) : startHeadless(start));
+  } catch (error) {
+    // Um worktree criado agora para uma delegação que não começou (o terminal não abriu, o comando ficou
+    // longo demais) não fica para trás.
+    if (prepared && !hadWorktree) await discardNewWorktree(issue, prepared.worktree).catch(() => undefined);
+    throw error;
+  }
+});
+
+/** Sessões que rodam (ou rodaram) no worktree da issue. */
+function sessionsInWorktree(issue: Issue) {
+  const root = issue.worktree?.root;
+  return root ? db.sessions.filter((s) => s.worktree && samePath(s.worktree.root, root)) : [];
+}
+
+/**
+ * Uma sessão em segundo plano roda agora no worktree da issue: não dá para removê-lo. Com `still =
+ * isWorking`, uma que já respondeu e só está saindo não conta (a remoção espera por ela).
+ */
+function worktreeBusy(issue: Issue, still = isRunning): boolean {
+  return sessionsInWorktree(issue).some((s) => still(s.id));
+}
+
+// A pasta e a branch que um worktree novo teria agora (a prévia ao delegar), ou o worktree que a issue já tem.
+app.get('/api/issues/:id/worktree/plan', async (req, res) => {
+  const issue = getIssue(req.params.id);
+  res.json(await planWorktree(getWorkspace(issue.workspaceId), issue));
+});
+
+app.get('/api/issues/:id/worktree', async (req, res) => {
+  const issue = getIssue(req.params.id);
+  res.json(await worktreeStatus(issue, worktreeBusy(issue, isWorking)));
+});
+
+// Remove o worktree da issue (?force=1: mesmo com alterações sem commit, que se perdem). As branches continuam nos repositórios.
+app.delete('/api/issues/:id/worktree', async (req, res) => {
+  const issue = getIssue(req.params.id);
+  // Uma sessão que já respondeu ainda pode estar saindo, com a pasta aberta: espera ela terminar.
+  await Promise.all(sessionsInWorktree(issue).map((s) => settleRun(s.id)));
+  await removeWorktree(issue, { force: req.query.force === '1', busy: worktreeBusy(issue) });
+  res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------- sessões
@@ -791,11 +896,23 @@ app.get('/api/sessions/:id/activities', (req, res) => {
   res.json(sessionActivities(getSession(req.params.id).id));
 });
 
-app.post('/api/sessions/:id/message', (req, res) => {
+// Imagem que foi junto de uma mensagem. O nome vem do conteúdo, então o arquivo nunca muda.
+app.get('/api/sessions/:id/images/:name', (req, res) => {
+  const file = imageFile(getSession(req.params.id).id, req.params.name);
+  if (!file) throw new HttpError(404, 'Imagem não encontrada.');
+  // Relativo à pasta: pelo caminho completo, o ".octo" contaria como arquivo oculto e daria 404.
+  res.sendFile(path.basename(file), {
+    root: path.dirname(file),
+    headers: { 'Cache-Control': 'private, max-age=31536000, immutable', 'X-Content-Type-Options': 'nosniff' },
+  });
+});
+
+app.post('/api/sessions/:id/message', imageJson, async (req, res) => {
   const session = getSession(req.params.id);
   const text = str(req.body.text).trim();
-  if (!text) throw new HttpError(400, 'Escreva uma mensagem.');
-  sendMessage(session, text, allowedRules(req.body.allowedTools), settingsChanges(req.body));
+  const images = parseImages(req.body.images);
+  if (!text && !images.length) throw new HttpError(400, 'Escreva uma mensagem ou anexe uma imagem.');
+  await sendMessage(session, text, allowedRules(req.body.allowedTools), settingsChanges(req.body), images);
   res.json(session);
 });
 
@@ -859,10 +976,13 @@ if (existsSync(DIST)) {
   });
 }
 
-app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
   // HttpError e erros do body-parser trazem o status; o resto é falha interna.
   const status = Number((error as { status?: number })?.status) || 500;
-  const message = error instanceof Error ? error.message : String(error);
+  let message = error instanceof Error ? error.message : String(error);
+  if ((error as { type?: string })?.type === 'entity.too.large') {
+    message = takesImages(req) ? 'A mensagem ficou grande demais: envie menos imagens ou imagens menores.' : 'O conteúdo enviado passa do limite de 2 MB.';
+  }
   if (status >= 500) console.error('[octo]', error);
   res.status(status).json({ error: message });
 });

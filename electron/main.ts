@@ -340,8 +340,11 @@ function showInterface(): void {
 
 // ---------------------------------------------------------------- permissões
 
-/** Liberadas só para a própria interface: avisos de agentes e os botões de copiar. */
-const ALLOWED_PERMISSIONS = new Set<string>(['notifications', 'clipboard-sanitized-write']);
+/**
+ * Liberadas só para a própria interface: avisos de agentes, os botões de copiar e a leitura da área
+ * de transferência, que o Alt+V usa para anexar a imagem copiada mesmo com texto junto.
+ */
+const ALLOWED_PERMISSIONS = new Set<string>(['notifications', 'clipboard-sanitized-write', 'clipboard-read']);
 
 /**
  * Sem um handler, o Electron aprova sozinho pedidos de câmera, microfone, localização etc. A janela
@@ -608,7 +611,10 @@ if (SELF_TEST) {
   app.quit();
 } else {
   app.setName('Octo');
-  if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
+  // Fora do pacote (npm run desktop) o id é outro: ao notificar, o Windows cria um atalho
+  // "Electron" no Menu Iniciar para o electron.exe com esse id, e com o id do app instalado ele
+  // tomaria o lugar do atalho do Octo na busca e na barra de tarefas.
+  if (process.platform === 'win32') app.setAppUserModelId(app.isPackaged ? APP_ID : `${APP_ID}.dev`);
 
   app.on('second-instance', () => {
     if (!started) return;

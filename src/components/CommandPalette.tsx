@@ -6,7 +6,7 @@ import {
 import { api } from '../api.ts';
 import { openClaudeIn } from '../integrations.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
-import { modKey, repoGroups } from '../util.ts';
+import { isMac, modKey, repoGroups } from '../util.ts';
 import { StatusIcon } from './icons.tsx';
 import { openInEditor } from './OpenMenu.tsx';
 import { Kbd, Modal, trapTab, useDialog, useEscapeLayer } from './ui.tsx';
@@ -203,6 +203,8 @@ function shortcutGroups(mod: string): { title: string; keys: [string, string][] 
         ['Esc', 'Num campo com texto, o primeiro Esc só sai do campo'],
         [`${mod} Enter`, 'Envia a resposta ao agente ou cria a issue'],
         ['/', 'No começo da resposta ao agente: lista as skills e os comandos da conta'],
+        [`${mod} V`, 'Na resposta ao agente (e ao delegar): anexa a imagem copiada, como um print'],
+        [`${isMac() ? '⌥' : 'Alt'} V`, 'Anexa a imagem copiada mesmo quando há texto copiado junto'],
         [`${mod} S`, 'Salva skills, agentes, comandos e o settings.json'],
       ],
     },

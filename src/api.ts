@@ -1,6 +1,6 @@
 import type {
-  AccountConfig, AccountStatus, Activity, AgentSession, AppState, AvailablePlugin, ClaudeAccount, ClaudeItem, ClaudeItemKind, Integrations, Issue,
-  Preferences, Repo, RepoChanges, ServerEvent, SessionSettings, UpdateInfo, Workspace,
+  AccountConfig, AccountStatus, Activity, AgentSession, AppState, AvailablePlugin, ClaudeAccount, ClaudeItem, ClaudeItemKind, ImageInput, Integrations,
+  Issue, Preferences, Repo, RepoChanges, ServerEvent, SessionSettings, UpdateInfo, Workspace, WorktreeBase, WorktreeStatus,
 } from '../shared/types.ts';
 import { toast, useStore } from './store.ts';
 
@@ -77,6 +77,15 @@ export interface DelegateInput extends SettingsInput {
   accountId: string;
   instructions: string;
   mode: 'headless' | 'terminal';
+  /** Só em segundo plano: vão junto com as instruções. */
+  images?: ImageInput[];
+  /** Roda no worktree da issue (criado agora a partir desta base, ou o que ela já tem); null = na pasta original. */
+  worktree?: WorktreeBase | null;
+}
+
+/** Endereço de uma imagem que foi junto com uma mensagem (do próprio Octo: a CSP não carrega imagens de fora). */
+export function imageUrl(sessionId: string, name: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/images/${encodeURIComponent(name)}`;
 }
 
 export const api = {
@@ -133,11 +142,19 @@ export const api = {
   updateIssue: (id: string, body: Partial<Issue>) => patch<Issue>(`/issues/${id}`, body),
   deleteIssue: (id: string) => request('DELETE', `/issues/${id}`),
   delegate: (id: string, body: DelegateInput) => post<AgentSession>(`/issues/${id}/delegate`, body),
+  /** `quiet`: o diálogo de remoção mostra a falha com "Tentar de novo" em vez de um aviso. */
+  worktreeStatus: (id: string, quiet = false) => request<WorktreeStatus>('GET', `/issues/${id}/worktree`, undefined, { quiet }),
+  /** A pasta e a branch que um worktree novo teria agora (já com -2, -3 se o nome estiver ocupado); sem aviso de erro: a prévia fica com o nome calculado aqui. */
+  worktreePlan: (id: string) =>
+    request<{ root: string; branch: string; reuse: boolean } | null>('GET', `/issues/${id}/worktree/plan`, undefined, { quiet: true }),
+  /** Sem `force`, o servidor recusa (409) se houver alterações sem commit, que seriam perdidas. */
+  removeWorktree: (id: string, force: boolean) => request<{ ok: true }>('DELETE', `/issues/${id}/worktree${query({ force: force ? '1' : undefined })}`),
 
   /** `quiet`: o feed mostra a falha com "Tentar de novo" em vez de um aviso. */
   activities: (sessionId: string, quiet = false) => request<Activity[]>('GET', `/sessions/${sessionId}/activities`, undefined, { quiet }),
-  message: (sessionId: string, text: string, allowedTools: string[] = [], changes: Partial<SettingsInput> = {}) =>
-    post<AgentSession>(`/sessions/${sessionId}/message`, { text, allowedTools, ...changes }),
+  /** `text` pode ficar vazio quando há imagens. */
+  message: (sessionId: string, text: string, allowedTools: string[] = [], changes: Partial<SettingsInput> = {}, images: ImageInput[] = []) =>
+    post<AgentSession>(`/sessions/${sessionId}/message`, { text, allowedTools, ...changes, ...(images.length ? { images } : {}) }),
   stop: (sessionId: string) => post(`/sessions/${sessionId}/stop`),
   dismissDenials: (sessionId: string) => post(`/sessions/${sessionId}/dismiss-denials`),
   /** Sessão de terminal (ou aguardando você) encerrada pela interface: vira concluída. */
