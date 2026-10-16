@@ -281,12 +281,21 @@ export function fitsCommandLine(command: string, args: string[]): boolean {
 }
 
 /**
+ * Onde cortar `text` para ficar com até `end` unidades sem separar um par substituto (emoji e outros
+ * caracteres fora do plano básico): metade de um par viraria "�" no processo filho.
+ */
+export function cutPoint(text: string, end: number): number {
+  const code = text.charCodeAt(end - 1);
+  return end > 0 && end < text.length && code >= 0xd800 && code <= 0xdbff ? end - 1 : end;
+}
+
+/**
  * Corta `text` pelo fim (acrescentando `notice`) até `build(text)` caber na linha de comando.
  * Devolve null se nem com `minLength` caracteres couber.
  */
 export function shrinkToFit(command: string, build: (text: string) => string[], text: string, notice: string, minLength = 0): string | null {
   if (fitsCommandLine(command, build(text))) return text;
-  let low = Math.min(minLength, text.length);
+  let low = cutPoint(text, Math.min(minLength, text.length));
   if (!fitsCommandLine(command, build(text.slice(0, low) + notice))) return null;
   let high = text.length;
   while (low < high) {
@@ -294,5 +303,6 @@ export function shrinkToFit(command: string, build: (text: string) => string[], 
     if (fitsCommandLine(command, build(text.slice(0, middle) + notice))) low = middle;
     else high = middle - 1;
   }
-  return text.slice(0, low) + notice;
+  // Um corte um pouco mais curto sempre cabe.
+  return text.slice(0, cutPoint(text, low)) + notice;
 }

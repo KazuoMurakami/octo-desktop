@@ -862,6 +862,9 @@ function ContextModal({ dir, onClose }: { dir?: string; onClose: () => void }) {
   }, [workspaceId, dir, attempt]);
   const where = useMemo(() => (workspace && dir ? relativeTo(workspace.rootPath, dir) : 'raiz'), [workspace, dir]);
   if (!workspace) return null;
+  // O arquivo precisa ser corrigido à mão (marcadores que não formam um bloco só, ou fora de UTF-8): o servidor recusaria a gravação.
+  const problem = info?.problem ?? null;
+  const recheck = () => setAttempt((n) => n + 1);
 
   const write = async () => {
     setBusy(true);
@@ -869,6 +872,8 @@ function ContextModal({ dir, onClose }: { dir?: string; onClose: () => void }) {
       const { file } = await api.writeContext(workspace.id, dir);
       toast(`Contexto salvo em ${file}`, 'success');
       onClose();
+    } catch {
+      recheck(); // o aviso de erro já apareceu (api.ts); o arquivo pode ter mudado desde a prévia
     } finally {
       setBusy(false);
     }
@@ -882,9 +887,11 @@ function ContextModal({ dir, onClose }: { dir?: string; onClose: () => void }) {
       footer={
         <>
           <span className="foot-hint dim">
-            {info?.exists ? (info.managed ? 'Atualiza só o bloco do Octo no arquivo existente.' : 'Acrescenta o bloco ao fim do seu CLAUDE.md, sem apagar nada.') : 'Cria o arquivo.'}
+            {problem
+              ? 'O Octo não altera este arquivo até ele ser corrigido.'
+              : info?.exists ? (info.managed ? 'Atualiza só o bloco do Octo no arquivo existente.' : 'Acrescenta o bloco ao fim do seu CLAUDE.md, sem apagar nada.') : 'Cria o arquivo.'}
           </span>
-          <button className="primary-btn" onClick={write} disabled={busy || !info}>{info?.managed ? 'Atualizar' : 'Gravar'} CLAUDE.md</button>
+          <button className="primary-btn" onClick={write} disabled={busy || !info || Boolean(problem)}>{info?.managed ? 'Atualizar' : 'Gravar'} CLAUDE.md</button>
         </>
       }
     >
@@ -895,10 +902,29 @@ function ContextModal({ dir, onClose }: { dir?: string; onClose: () => void }) {
       {error && !info ? (
         <div className="inline-error">
           Não foi possível gerar a prévia: {error}{' '}
-          <button className="link-btn" onClick={() => setAttempt((n) => n + 1)}>Tentar de novo</button>
+          <button className="link-btn" onClick={recheck}>Tentar de novo</button>
         </div>
       ) : (
-        <pre className="context-preview">{info?.preview ?? 'Gerando…'}</pre>
+        <>
+          {problem && (
+            <div className="composer-warning" role="alert">
+              <AlertTriangle size={13} />
+              <div className="md">
+                <p>{problem}</p>
+                {info?.markers.length ? (
+                  <ul>
+                    {info.markers.map((m) => <li key={m.line}>Linha {m.line}: <code>{m.marker}</code></li>)}
+                  </ul>
+                ) : null}
+                <p>
+                  Arquivo: <code>{info?.file}</code>.{' '}
+                  <button className="link-btn" onClick={recheck}>Verificar de novo</button>
+                </p>
+              </div>
+            </div>
+          )}
+          <pre className="context-preview">{info?.preview ?? 'Gerando…'}</pre>
+        </>
       )}
     </Modal>
   );

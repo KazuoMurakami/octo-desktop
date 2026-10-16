@@ -2,6 +2,8 @@
 # segurança com frequência; as ações do GitHub estão fixadas por SHA e só se atualizam por aqui.
 # As atualizações de segurança (Settings → Code security → Dependabot security updates) chegam na hora;
 # a espera de 7 dias vale só para as versões novas comuns, para não pegar um pacote recém-publicado com problema.
+# O Electron fica fora dessa espera: as correções do Chromium e do V8 saem como versões comuns, sem
+# alerta de segurança, e entrariam com até duas semanas de atraso.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -10,6 +12,7 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+      exclude: [electron]
     open-pull-requests-limit: 10
     groups:
       # Electron e electron-builder sobem juntos: mudam o app empacotado e precisam do autoteste do release.

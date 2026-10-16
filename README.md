@@ -76,7 +76,7 @@ O Octo não substitui o Claude Code: ele usa o `claude` que já está instalado 
 
 - **Claude Code** instalado e logado no mesmo sistema do Octo: rode `claude` uma vez no terminal ([como instalar](https://docs.claude.com/en/docs/claude-code/setup)). No Windows, instale no próprio Windows; um Claude Code que existe só dentro do WSL não é encontrado. Se o Octo não achar o Claude Code, a tela inicial mostra como instalar.
 - **Uma conta com acesso ao Claude Code** (Pro, Max, Team, Enterprise ou créditos de API). Cada sessão do Octo consome a cota dessa conta, como o `claude` no seu terminal.
-- **git** ([download](https://git-scm.com/downloads)). No macOS ele vem com `xcode-select --install` ou com o Homebrew; sem ele, o macOS mostra um aviso pedindo para instalar as ferramentas de desenvolvedor na primeira busca de repositórios.
+- **git** 2.31 ou mais novo ([download](https://git-scm.com/downloads)). No macOS ele vem com `xcode-select --install` ou com o Homebrew; sem ele, o macOS mostra um aviso pedindo para instalar as ferramentas de desenvolvedor na primeira busca de repositórios.
 
 | Sistema | Download | Situação | Observação |
 | --- | --- | --- | --- |

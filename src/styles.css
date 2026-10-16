@@ -409,15 +409,17 @@ textarea {
   inset: -1px;
   border-radius: 9px;
   padding: 1px;
-  background: conic-gradient(from var(--angle, 0deg), transparent 70%, var(--agent));
+  /* Um brilho parado no canto, que pulsa só na opacidade: o compositor anima sozinho. Girar o gradiente (uma
+     @property animada) refazia estilo e pintura a cada quadro, na thread da interface, enquanto o agente trabalha.
+     Parado, o arco é simétrico: a "cabeça" do cometa, que só fazia sentido girando, viraria um corte na borda. */
+  background: conic-gradient(from 135deg, var(--agent), transparent 20%, transparent 80%, var(--agent));
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
   mask-composite: exclude;
-  animation: sweep 2.4s linear infinite;
+  animation: live-pulse 1.6s ease-in-out infinite;
   pointer-events: none;
 }
-@property --angle { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
-@keyframes sweep { to { --angle: 360deg; } }
+@keyframes live-pulse { 50% { opacity: 0.35; } }
 @keyframes rise { from { opacity: 0; transform: translateY(3px); } }
 .card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
 .card-top .avatar { margin-left: auto; }
@@ -495,8 +497,10 @@ textarea {
 .status-icon { flex: none; }
 
 .orbit { color: var(--agent); flex: none; }
-.orbit .orbit-moon { transform-origin: 10px 10px; }
-.orbit.is-active .orbit-moon { animation: orbit 1.6s linear infinite; }
+/* Gira o <svg> inteiro, em torno do próprio centro, e não a lua lá dentro: o transform do <svg> o compositor anima
+   sozinho, e o de um <circle> refazia o layout da coluna de issues inteira a cada passo. Anel e núcleo são
+   concêntricos: girando, só a lua anda (ver OrbitMark). */
+.orbit.is-active { transform-origin: 50% 50%; animation: orbit 1.6s linear infinite; }
 @keyframes orbit { to { transform: rotate(360deg); } }
 /* Logo: o fundo quase preto da imagem some sobre o fundo do app (lighten fica com o mais claro). */
 .brand-mark { width: 72px; height: 72px; border-radius: 18px; mix-blend-mode: lighten; }
@@ -800,7 +804,9 @@ fieldset.delegate { border: 0; margin: 0; padding: 0; min-width: 0; }
   border: 1px solid var(--border-strong);
   border-radius: 11px;
   background: var(--bg);
-  overflow: hidden;
+  /* O feed encolhe até o mínimo dele; se nem assim couber (ex.: muitas ações bloqueadas), a caixa rola em vez de
+     cortar os botões das permissões e a caixa de resposta. */
+  overflow: hidden auto;
   min-height: 0;
 }
 /* Sem espaço para o texto ao lado dos botões, os botões descem para uma linha própria (o texto não some). */
@@ -869,6 +875,10 @@ fieldset.delegate { border: 0; margin: 0; padding: 0; min-width: 0; }
 .act-action.is-error .act-tool-icon, .act-action.is-error .act-action-text { color: var(--danger); }
 .act-pending { width: 6px; height: 6px; border-radius: 50%; background: var(--agent); animation: blink 1s ease-in-out infinite; flex: none; }
 @keyframes blink { 50% { opacity: 0.25; } }
+/* Pisca só com a sessão rodando, e só nas ações da execução atual: numa que já terminou (interrompida, com erro), a
+   ação sem resultado nunca vai recebê-lo, e o ponto ficaria piscando para sempre, também durante as execuções
+   seguintes (is-stale: ação de antes do último prompt, ver Feed). */
+.feed:not(.is-live) .act-pending, .act-pending.is-stale { animation: none; opacity: 0.4; }
 .act-detail { padding: 4px 8px 8px 30px; display: flex; flex-direction: column; gap: 6px; }
 .act-detail pre {
   margin: 0;
@@ -887,9 +897,22 @@ fieldset.delegate { border: 0; margin: 0; padding: 0; min-width: 0; }
 
 .denials { margin: 0 14px 10px; padding: 12px; border-radius: 9px; border: 1px solid rgba(229, 184, 75, 0.35); background: rgba(229, 184, 75, 0.07); }
 .denials-head { display: flex; align-items: center; gap: 8px; color: var(--warn); font-weight: 600; margin-bottom: 8px; }
-.denial { display: flex; gap: 8px; align-items: center; padding: 3px 0; }
+/* A caixa fica na altura da primeira linha da regra (centrada nela), também quando a regra ou o aviso quebram. */
+.denial { display: flex; gap: 8px; align-items: flex-start; padding: 3px 0; }
+.denial input { flex: none; margin-top: 4px; }
 .denial code { white-space: pre-wrap; overflow-wrap: anywhere; }
-.denials-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+/* A regra com o aviso e, embaixo, o que foi bloqueado (o endereço, o arquivo, o comando do Monitor). */
+.denial-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* O aviso fica ao lado da regra; sem espaço, desce para baixo dela (alinhado à regra, não à caixa). */
+.denial-rule { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; min-width: 0; }
+.denial-warning { display: inline-flex; align-items: flex-start; gap: 5px; color: var(--warn); font-size: 12px; }
+.denial-warning svg { flex: none; margin-top: 2px; }
+/* Valeria para qualquer comando: riscada, sem caixa para marcar. */
+.denial.is-refused code { text-decoration: line-through; opacity: 0.6; }
+.denial.is-refused .denial-warning { color: var(--danger); }
+.denial-blocked { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Numa janela estreita, os botões descem um embaixo do outro em vez de sair da caixa. */
+.denials-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .denials-help { margin: 0 0 8px; color: var(--text-2); font-size: 12.5px; }
 
 .composer { display: flex; flex-direction: column; gap: 8px; padding: 8px 14px 14px; border-top: 1px solid var(--border); background: var(--bg-1); }

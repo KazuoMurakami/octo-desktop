@@ -51,10 +51,24 @@ const query = (params: Record<string, string | undefined>) => {
   return search.size ? `?${search}` : '';
 };
 
+/** Um marcador do bloco do Octo (ou do Nexo, o nome antigo) que começa uma linha do CLAUDE.md, fora de blocos de código. */
+export interface ContextMarker {
+  /** Linha do arquivo, a partir de 1. */
+  line: number;
+  marker: string;
+  family: 'octo' | 'nexo';
+  kind: 'start' | 'end';
+}
+
 export interface ContextInfo {
   file: string;
   exists: boolean;
   managed: boolean;
+  /** O Octo não grava no arquivo até ele ser corrigido à mão (marcadores que não formam um bloco só, ou arquivo fora de UTF-8). */
+  damaged: boolean;
+  /** O que há de errado e como corrigir; null quando dá para gravar. */
+  problem: string | null;
+  markers: ContextMarker[];
   preview: string;
 }
 

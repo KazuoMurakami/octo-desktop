@@ -11,6 +11,7 @@ import {
   type AccountStatus, type AppState, type ClaudeAccount, type Effort, type Issue, type IssueStatus, type PermissionMode, type Priority,
   type Repo, type SessionSettings, type Workspace, type WorktreeBase,
 } from '../shared/types.ts';
+import { refusedReason, type RefusedReason } from '../shared/permissions.ts';
 import {
   dismissDenials, finishSession, isInside, isRunning, isWorking, refuseTerminalImages, resumeInTerminal, sendMessage, sessionActivities, settleRun,
   startHeadless,
@@ -171,8 +172,9 @@ function existingDirs(value: unknown): string[] {
 }
 
 /**
- * Regras de --allowedTools (ex.: "Bash(npm test)", "Edit", "mcp__servidor__ferramenta"). Nunca
- * começam com "-": um valor assim encerraria a lista e viraria uma opção do claude.
+ * Regras das ações liberadas numa resposta (ex.: "Bash(npm test)", "Edit", "mcp__servidor__ferramenta").
+ * Cada uma vai inteira num item do permissions.allow do --settings (ver planRun, em agent.ts): só
+ * passa `Ferramenta` ou `Ferramenta(conteúdo)`, com o nome sem curinga ("*", "Bash*") e nada depois do ")".
  */
 function allowedRules(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -180,9 +182,19 @@ function allowedRules(value: unknown): string[] {
   if (rules.length > 50) throw new HttpError(400, 'Libere no máximo 50 ações de uma vez.');
   for (const rule of rules) {
     if (!/^[A-Za-z][\w.:-]*(\([\s\S]*\))?$/.test(rule)) throw new HttpError(400, `Regra de permissão inválida: ${rule.slice(0, 80)}`);
+    // Valeria para qualquer comando (ver refusedReason): o painel já mostra essas riscadas, sem caixa para marcar.
+    const refused = refusedReason(rule);
+    if (refused) throw new HttpError(400, `Regra de permissão ampla demais: ${rule.slice(0, 80)} liberaria qualquer comando ${REFUSED[refused]}`);
   }
   return rules;
 }
+
+/** O motivo e o que fazer, no fim da recusa de uma regra que liberaria qualquer comando. */
+const REFUSED: Record<RefusedReason, string> = {
+  empty: '(sem comando definido). Desmarque essa ação, ou responda sem liberar.',
+  program: '(o * está no lugar do programa). Desmarque essa ação, ou responda sem liberar.',
+  monitor: '(o Monitor roda comandos pelo shell). Libere o comando exato, numa regra Bash(...), ou responda sem liberar.',
+};
 
 function budget(value: unknown): number | null {
   const amount = Number(value);

@@ -11,9 +11,20 @@ permissions:
 
 jobs:
   check:
-    # Fixo: o ubuntu-latest passa para o 26.04 entre outubro e novembro de 2026.
-    runs-on: ubuntu-24.04
+    # Os três sistemas, porque há código só de Windows (o principal) e só de macOS; e o Node mínimo
+    # prometido no package.json (engines), além do atual.
+    strategy:
+      fail-fast: false
+      matrix:
+        # Fixo: o ubuntu-latest passa para o 26.04 entre outubro e novembro de 2026.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+        node: ['22.18.0', '24']
+    name: check (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: 1
     steps:
@@ -22,7 +33,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run typecheck
@@ -45,6 +56,10 @@ jobs:
           grep -q '<div id="root">' <<< "$html"
           # A página da interface sai com Content-Security-Policy.
           grep -qi '^content-security-policy:.*frame-ancestors' headers.txt
+      - name: Dependências do app sem vulnerabilidade alta
+        # Só as que vão no app (o express e as dele); as do build têm alertas moderados sem correção.
+        if: matrix.os == 'ubuntu-24.04' && matrix.node == '24'
+        run: npm audit --omit=dev --audit-level=high
       - name: Log do servidor
         if: always()
         run: cat server.log || true

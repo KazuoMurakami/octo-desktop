@@ -7,7 +7,7 @@
 | Sistema | Windows 10 ou 11, x64 | macOS 13 (Ventura) ou mais novo, Apple Silicon ou Intel | x64, distribuição atual (Ubuntu 22.04+, Debian 12+, Fedora, Arch…) |
 | Situação | testado | beta | beta |
 | Claude Code | Instalado no próprio Windows (o do WSL não é encontrado) | Instalado e no PATH do seu shell | Instalado e no PATH do seu shell |
-| git | [Git for Windows](https://git-scm.com/download/win) | `xcode-select --install` ou Homebrew | Pelo gerenciador de pacotes |
+| git (2.31 ou mais novo) | [Git for Windows](https://git-scm.com/download/win) | `xcode-select --install` ou Homebrew | Pelo gerenciador de pacotes |
 
 Em todos os sistemas, o Claude Code precisa estar logado: rode `claude` uma vez no terminal. Cada sessão do Octo usa a cota da conta escolhida (plano Pro, Max, Team, Enterprise ou créditos de API), como o `claude` no seu terminal.
 

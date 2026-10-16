@@ -3,9 +3,10 @@ import {
   AlertTriangle, ChevronRight, CircleCheck, CornerDownLeft, FileDiff, FileEdit, FolderOpen, FilePlus, FileText, GitBranch, Globe, ListChecks,
   MessageSquare, RefreshCw, Search, ShieldQuestion, Square, SquareTerminal, TerminalSquare, Users, Wrench,
 } from 'lucide-react';
+import { refusedReason, ruleKind, type RefusedReason, type RuleKind } from '../../shared/permissions.ts';
 import {
-  EFFORT_LABEL, MAX_IMAGES, PERMISSION_HELP, PERMISSION_LABEL, type Activity, type AgentSession as Session, type Repo, type SessionSettings,
-  type Worktree,
+  EFFORT_LABEL, MAX_IMAGES, PERMISSION_HELP, PERMISSION_LABEL, type Activity, type AgentSession as Session, type PermissionDenial, type Repo,
+  type SessionSettings, type Worktree,
 } from '../../shared/types.ts';
 import { api, type SettingsInput } from '../api.ts';
 import { setting, useAccountConfig } from '../claudeConfig.ts';
@@ -290,7 +291,7 @@ export const AgentSessionView = memo(function AgentSessionView({ session }: { se
 
       <div
         hidden={tab === 'changes'}
-        className="feed"
+        className={`feed${live ? ' is-live' : ''}`}
         ref={scroller}
         onScroll={(e) => {
           const el = e.currentTarget;
@@ -361,15 +362,19 @@ function Feed({ activities, repoMap }: { activities: Activity[]; repoMap: RepoMa
     for (const a of activities) if (a.type === 'result' && a.toolUseId) map.set(a.toolUseId, a);
     return map;
   }, [activities]);
+  // Cada prompt começa uma execução: uma ação de antes do último que ficou sem resultado (a execução foi
+  // interrompida) nunca vai recebê-lo.
+  const lastPrompt = useMemo(() => activities.findLastIndex((a) => a.type === 'prompt'), [activities]);
 
   return (
     <>
-      {activities.map((activity) =>
+      {activities.map((activity, index) => {
         // Resultados aparecem dentro da ação correspondente.
-        activity.type === 'result' ? null : (
-          <ActivityItem key={activity.id} activity={activity} result={activity.toolUseId ? results.get(activity.toolUseId) : undefined} repoMap={repoMap} />
-        ),
-      )}
+        if (activity.type === 'result') return null;
+        const result = activity.toolUseId ? results.get(activity.toolUseId) : undefined;
+        const stale = activity.type === 'action' && !result && index < lastPrompt;
+        return <ActivityItem key={activity.id} activity={activity} result={result} repoMap={repoMap} stale={stale} />;
+      })}
     </>
   );
 }
@@ -377,8 +382,9 @@ function Feed({ activities, repoMap }: { activities: Activity[]; repoMap: RepoMa
 /**
  * Um item do feed. Uma atividade gravada não muda (só é trocada inteira), então a comparação por
  * referência basta: a cada evento só o item novo renderiza, e o Markdown dos outros não é refeito.
+ * `stale`: ação sem resultado de uma execução anterior (ver Feed), que só muda num prompt novo.
  */
-const ActivityItem = memo(function ActivityItem({ activity, result, repoMap }: { activity: Activity; result?: Activity; repoMap: RepoMap }) {
+const ActivityItem = memo(function ActivityItem({ activity, result, repoMap, stale = false }: { activity: Activity; result?: Activity; repoMap: RepoMap; stale?: boolean }) {
   switch (activity.type) {
     case 'prompt':
       return (
@@ -410,13 +416,13 @@ const ActivityItem = memo(function ActivityItem({ activity, result, repoMap }: {
     case 'error':
       return <div className="act act-error"><AlertTriangle size={14} /> <span>{activity.text}</span></div>;
     case 'action':
-      return <Action activity={activity} result={result} repoMap={repoMap} />;
+      return <Action activity={activity} result={result} repoMap={repoMap} stale={stale} />;
     default:
       return null;
   }
 });
 
-function Action({ activity, result, repoMap }: { activity: Activity; result?: Activity; repoMap: RepoMap }) {
+function Action({ activity, result, repoMap, stale }: { activity: Activity; result?: Activity; repoMap: RepoMap; stale: boolean }) {
   const [open, setOpen] = useState(false);
   const Icon = TOOL_ICON[activity.tool ?? ''] ?? Wrench;
   const expandable = Boolean(activity.detail || result?.text);
@@ -426,7 +432,7 @@ function Action({ activity, result, repoMap }: { activity: Activity; result?: Ac
         <Icon size={13} className="act-tool-icon" />
         <span className="act-action-text">{activity.text}</span>
         {(activity.repoIds ?? []).map((id) => repoMap.get(id)).filter(Boolean).map((repo) => <RepoChip key={repo!.id} repo={repo!} lit />)}
-        {!result && <span className="act-pending" />}
+        {!result && <span className={`act-pending${stale ? ' is-stale' : ''}`} />}
         {expandable && <ChevronRight size={13} className="act-chevron" />}
       </button>
       {open && (
@@ -451,12 +457,87 @@ function Collapsible({ summary, children, className }: { summary: string; childr
   );
 }
 
+/** Como seguir com o que não dá para liberar por aqui. */
+const REFUSED_HOW = 'Para seguir, continue no terminal, onde o Claude pergunta na hora, ou responda ao agente pedindo o comando exato.';
+
+/** Por que a regra valeria para qualquer comando (ver refusedReason). */
+const REFUSED_WHY: Record<RefusedReason, string> = {
+  empty: 'A regra está sem comando definido, então valeria para qualquer comando, e o Octo não a libera.',
+  program: 'O * está no lugar do programa, então a regra valeria para qualquer comando, e o Octo não a libera.',
+  monitor: 'O Monitor roda comandos pelo shell, então liberá-lo valeria para qualquer comando, e o Octo não libera.',
+};
+
+/** O aviso ao lado de uma regra que libera mais do que o bloqueado (ver ruleKind), com a explicação no title. */
+function ruleWarning(kind: RuleKind, reason: RefusedReason | null): { text: string; title: string } | null {
+  switch (kind) {
+    case 'refused':
+      return { text: 'Valeria para qualquer comando: não dá para liberar por aqui.', title: `${REFUSED_WHY[reason ?? 'empty']} ${REFUSED_HOW}` };
+    case 'wildcard':
+      return {
+        text: 'O * é curinga: libera também outros comandos.',
+        title: 'Nas regras de permissão do Claude Code, o * vale por qualquer texto, inclusive espaços: esta regra libera todo comando nesse formato, e não só o que foi bloqueado. Depois de um programa que roda outros (sh -c *, env *, sudo *), vale para qualquer comando.',
+      };
+    case 'whole-tool':
+      return {
+        text: 'Libera a ferramenta inteira nesta execução, não só o que foi bloqueado.',
+        title: 'Só com o nome da ferramenta, a regra vale para todo uso dela até o agente terminar esta execução (qualquer endereço, arquivo ou chamada), e não só para o que foi bloqueado.',
+      };
+    default:
+      return null;
+  }
+}
+
+/** Os campos da ação que dizem o que foi bloqueado: o comando, o endereço, o arquivo ou a busca. */
+const BLOCKED_KEYS = ['command', 'url', 'file_path', 'notebook_path', 'path', 'query'];
+
+/**
+ * O que foi bloqueado com cada regra, para mostrar embaixo dela: a regra de um WebFetch vale para o site
+ * inteiro e a de um Write, para qualquer arquivo, mas só um endereço e um arquivo foram pedidos. Fica de
+ * fora o que a própria regra já mostra (o comando de Bash(npm test)).
+ */
+function blockedBy(rule: string, denials: PermissionDenial[]): string[] {
+  const tool = rule.split('(')[0];
+  const texts = denials
+    .filter((denial) => denial.rule === rule)
+    .flatMap((denial) => {
+      const value = BLOCKED_KEYS.map((key) => denial.input[key]).find((v): v is string => typeof v === 'string' && v.trim() !== '');
+      if (!value || rule === `${denial.tool}(${value})`) return [];
+      // O comando de um Monitor vira uma regra de Bash: o nome diz de onde ele veio.
+      return [denial.tool === tool ? value : `${denial.tool}: ${value}`];
+    });
+  return [...new Set(texts)];
+}
+
+/** Uma linha curta (o texto inteiro fica no title). */
+function oneLine(text: string, max = 200): string {
+  const line = text.replace(/\s+/g, ' ').trim();
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+}
+
+/** Ainda há o que liberar por aqui, mas nada marcado. */
+const NOTHING_CHOSEN = 'Marque o que quer liberar: o que vale para mais do que foi bloqueado vem desmarcado. Se o agente já resolveu de outro jeito, conclua.';
+const REFUSED_HINT = ' O que está riscado não dá para liberar por aqui: continue no terminal ou peça ao agente o comando exato.';
+
 /** Equivalente à "elicitation" do Linear: o agente parou porque precisa de permissão. */
 function Denials({ session, canContinue }: { session: Session; canContinue: boolean }) {
   // O agente costuma repetir o mesmo comando negado: cada regra aparece uma vez só.
-  const rules = useMemo(() => [...new Set(session.pendingDenials.map((d) => d.rule))], [session.pendingDenials]);
-  const [chosen, setChosen] = useState(() => new Set(rules));
+  const rows = useMemo(
+    () =>
+      [...new Set(session.pendingDenials.map((d) => d.rule))].map((rule) => ({
+        rule,
+        kind: ruleKind(rule),
+        reason: refusedReason(rule),
+        blocked: blockedBy(rule, session.pendingDenials),
+      })),
+    [session.pendingDenials],
+  );
+  // Só vem marcado o que libera apenas o que foi bloqueado: o resto vale para mais, e só vai se você marcar.
+  const [chosen, setChosen] = useState(() => new Set(rows.filter((row) => row.kind === 'scoped').map((row) => row.rule)));
   const [busy, setBusy] = useState(false);
+  // O que vale para qualquer comando nunca vai (o servidor recusaria): nem tem caixa para marcar.
+  const selected = rows.filter((row) => row.kind !== 'refused' && chosen.has(row.rule)).map((row) => row.rule);
+  const selectable = rows.some((row) => row.kind !== 'refused');
+  const hint = rows.some((row) => row.kind === 'refused') ? REFUSED_HINT : '';
   const toggle = (rule: string) =>
     setChosen((c) => {
       const next = new Set(c);
@@ -479,20 +560,43 @@ function Denials({ session, canContinue }: { session: Session; canContinue: bool
     <div className="denials">
       <div className="denials-head">
         <ShieldQuestion size={15} />
-        {rules.length === 1 ? 'Uma ação foi bloqueada' : `${rules.length} ações foram bloqueadas`} pelo modo de permissão
+        {rows.length === 1 ? 'Uma ação foi bloqueada' : `${rows.length} ações foram bloqueadas`} pelo modo de permissão
       </div>
-      <p className="denials-help">Se o agente precisava disso para terminar, permita e ele continua de onde parou. Se ele já resolveu de outro jeito, conclua.</p>
-      {rules.map((rule) => (
-        <label key={rule} className="denial">
-          <input type="checkbox" checked={chosen.has(rule)} onChange={() => toggle(rule)} disabled={busy} />
-          <code>{rule}</code>
-        </label>
-      ))}
+      <p className="denials-help">
+        {!selectable
+          ? `${rows.length === 1 ? 'Esta ação não dá para liberar por aqui: valeria' : 'Nenhuma destas ações dá para liberar por aqui: valeriam'} para qualquer comando. ${REFUSED_HOW} Se ele já resolveu de outro jeito, conclua.`
+          : selected.length
+            ? `Se o agente precisava disso para terminar, permita e ele continua de onde parou. Se ele já resolveu de outro jeito, conclua.${hint}`
+            : `${NOTHING_CHOSEN}${hint}`}
+      </p>
+      {rows.map(({ rule, kind, reason, blocked }) => {
+        const warning = ruleWarning(kind, reason);
+        return (
+          <label key={rule} className={`denial is-${kind}`}>
+            <input type="checkbox" checked={kind !== 'refused' && chosen.has(rule)} onChange={() => toggle(rule)} disabled={busy || kind === 'refused'} />
+            <span className="denial-body">
+              <span className="denial-rule">
+                <code>{rule}</code>
+                {warning && (
+                  <span className="denial-warning" title={warning.title}>
+                    <AlertTriangle size={12} /> {warning.text}
+                  </span>
+                )}
+              </span>
+              {blocked.slice(0, 3).map((text) => (
+                <small key={text} className="denial-blocked" title={text.slice(0, 2000)}>{oneLine(text)}</small>
+              ))}
+              {blocked.length > 3 && <small className="denial-blocked">e mais {blocked.length - 3}</small>}
+            </span>
+          </label>
+        );
+      })}
       <div className="denials-actions">
         <button
           className="primary-btn"
-          disabled={!chosen.size || busy || !canContinue}
-          onClick={() => void run(() => api.message(session.id, 'Permissão concedida para as ações bloqueadas. Continue de onde parou.', [...chosen]))}
+          disabled={!selected.length || busy || !canContinue}
+          title={selected.length ? undefined : selectable ? 'Marque as ações que quer liberar.' : 'O que foi bloqueado não dá para liberar por aqui.'}
+          onClick={() => void run(() => api.message(session.id, 'Permissão concedida para as ações bloqueadas. Continue de onde parou.', selected))}
         >
           {busy ? 'Enviando…' : 'Permitir e continuar'}
         </button>

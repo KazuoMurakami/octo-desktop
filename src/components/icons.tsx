@@ -73,13 +73,17 @@ export function PriorityIcon({ priority, size = 14 }: { priority: Priority; size
   );
 }
 
-/** Marca do agente: um núcleo com órbita — o Claude rodando no centro da pasta, enxergando os repos ao redor. */
+/**
+ * Marca do agente: um núcleo com órbita — o Claude rodando no centro da pasta, enxergando os repos ao redor.
+ * Ativa, o <svg> inteiro gira em torno do próprio centro (ver .orbit.is-active): só a lua pode sair do
+ * centro (10, 10); o anel e o núcleo continuam concêntricos, senão o desenho muda ao girar.
+ */
 export function OrbitMark({ size = 16, active = false }: { size?: number; active?: boolean }) {
   return (
     <svg width={size} height={size} viewBox="0 0 20 20" className={active ? 'orbit is-active' : 'orbit'}>
       <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeOpacity=".35" strokeWidth="1.2" />
       <circle cx="10" cy="10" r="3.2" fill="currentColor" />
-      <circle className="orbit-moon" cx="18" cy="10" r="1.6" fill="currentColor" />
+      <circle cx="18" cy="10" r="1.6" fill="currentColor" />
     </svg>
   );
 }
