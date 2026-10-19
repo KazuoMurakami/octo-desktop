@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, 
 import { AlertTriangle, Bot, ChevronDown, Ellipsis, FolderOpen, FolderX, GitBranch, SquareTerminal, Trash2, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
-  PRIORITY_LABEL, STATUSES, STATUS_LABEL, type AgentSession, type Issue, type Priority, type Worktree, type WorktreeStatus,
+  PRIORITY_LABEL, STATUSES, STATUS_LABEL, type Issue, type Priority, type Worktree, type WorktreeStatus,
 } from '../../shared/types.ts';
+import { isDeleting } from '../actions.ts';
 import { api } from '../api.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
-import { ago, commonFolder, hue, relativeTo } from '../util.ts';
-import { homePath, sessionFolderLabel, worktreeBranch, worktreeDir, worktreeName } from '../worktree.ts';
+import { ago, commonFolder, hue } from '../util.ts';
+import { homePath, runsIn, sessionFolderLabel, worktreeBranch, worktreeDir, worktreeName } from '../worktree.ts';
 import { loginHint } from './AccountsView.tsx';
 import { AgentSessionView } from './AgentSession.tsx';
 import { ConfirmDialog } from './modals.tsx';
@@ -87,17 +88,6 @@ function DrawerShell({ label, onClose, children }: { label: string; onClose: () 
   );
 }
 
-/** O agente está trabalhando nesta sessão agora, em segundo plano. */
-const isLive = (session: AgentSession) => session.state === 'active' || session.state === 'pending';
-
-/**
- * Um agente roda agora neste worktree: a regra do servidor para não removê-lo. Vale qualquer sessão nele, inclusive
- * uma aberta na pasta do worktree sem a issue.
- */
-function runsIn(sessions: AgentSession[], worktree: Worktree): boolean {
-  return sessions.some((s) => isLive(s) && s.worktree && relativeTo(s.worktree.root, worktree.root) === '.');
-}
-
 function IssueDetail({ issue, initialSessionId, onClose }: { issue: Issue; initialSessionId: string | null; onClose: () => void }) {
   const workspace = useWorkspace();
   const repos = useWorkspaceRepos();
@@ -115,10 +105,8 @@ function IssueDetail({ issue, initialSessionId, onClose }: { issue: Issue; initi
   const [description, setDescription] = useState(issue.description);
   const [editing, setEditing] = useState(!issue.description);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
-  const [confirmDelete, setConfirmDelete] = useState(false);
   /** O worktree que você pediu para remover (pela data de criação): um novo, criado depois, não reabre o diálogo. */
   const [removingWorktree, setRemovingWorktree] = useState<string | null>(null);
-  const home = useStore((s) => s.meta?.home);
 
   // Quando uma sessão nova começa depois que o painel abriu, ela passa a ser a exibida.
   const newest = sessions[0]?.id ?? null;
@@ -141,11 +129,11 @@ function IssueDetail({ issue, initialSessionId, onClose }: { issue: Issue; initi
   const draft = useRef({ title: issue.title, description: issue.description });
   const saved = useRef({ title: issue.title, description: issue.description });
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const removed = useRef(false);
 
   const flush = useCallback(() => {
     clearTimeout(timer.current);
-    if (removed.current) return;
+    // Sendo excluída (por este painel ou pelo botão direito no card): nada mais é gravado nela.
+    if (isDeleting(issue.id)) return;
     const body: Partial<Issue> = {};
     const nextTitle = draft.current.title.trim();
     if (nextTitle && nextTitle !== saved.current.title) body.title = nextTitle;
@@ -188,26 +176,7 @@ function IssueDetail({ issue, initialSessionId, onClose }: { issue: Issue; initi
   const worktree = issue.worktree ?? null;
   const cwd = worktree ? worktreeDir(worktree, issue.repoIds) : workspace ? commonFolder(workspace, issueRepos) : '';
   const folder = workspace ? sessionFolderLabel(workspace, cwd, worktree) : '';
-  const running = sessions.some(isLive);
-  // Só o agente rodando no worktree segura a exclusão (o worktree sai antes da issue, e não sai em uso); um que foi
-  // delegado na pasta original é interrompido junto com ela.
-  const busyInWorktree = worktree ? runsIn(allSessions, worktree) : false;
   const update = (body: Partial<Issue>) => api.updateIssue(issue.id, body);
-
-  const remove = async () => {
-    removed.current = true;
-    clearTimeout(timer.current);
-    try {
-      // O worktree sai junto (as branches ficam). Com alterações sem commit, o servidor recusa e avisa: aí ele sai
-      // antes por Mais ações › Remover worktree, que mostra o que se perde.
-      if (issue.worktree) await api.removeWorktree(issue.id, false);
-      await api.deleteIssue(issue.id);
-    } catch (error) {
-      removed.current = false;
-      throw error;
-    }
-    onClose();
-  };
 
   return (
     <>
@@ -228,7 +197,13 @@ function IssueDetail({ issue, initialSessionId, onClose }: { issue: Issue; initi
               ...(worktree
                 ? [{ key: 'worktree', label: 'Remover worktree…', icon: <FolderX size={14} />, onSelect: () => setRemovingWorktree(worktree.createdAt) }]
                 : []),
-              { key: 'delete', label: 'Excluir issue…', icon: <Trash2 size={14} />, danger: true, onSelect: () => setConfirmDelete(true) },
+              {
+                key: 'delete',
+                label: 'Excluir issue…',
+                icon: <Trash2 size={14} />,
+                danger: true,
+                onSelect: () => set({ modal: { kind: 'delete-issue', issueId: issue.id } }),
+              },
             ]}
           />
           <button className="icon-btn" onClick={onClose} title="Fechar (Esc)" aria-label="Fechar"><X size={16} /></button>
@@ -423,40 +398,6 @@ function IssueDetail({ issue, initialSessionId, onClose }: { issue: Issue; initi
           </div>
         </aside>
       </div>
-
-      {confirmDelete && (
-        <ConfirmDialog
-          title={`Excluir ${issue.identifier}?`}
-          confirmLabel="Excluir issue"
-          busyLabel="Excluindo…"
-          // Com o agente rodando no worktree, ele não sai: pare o agente antes.
-          disabled={busyInWorktree}
-          onConfirm={remove}
-          onClose={() => setConfirmDelete(false)}
-        >
-          <p>
-            A issue “{issue.title}” sai do quadro, com a descrição e o histórico.
-            {/* Travada, a exclusão não interrompe nada: quem para o agente é você. */}
-            {running && !busyInWorktree && <> <strong>O agente que está trabalhando nela será interrompido.</strong></>}
-          </p>
-          <p>
-            {sessions.length > 0 ? 'As sessões do agente continuam em Sessões do agente. ' : ''}
-            Nada muda nos arquivos dos repositórios.
-          </p>
-          {worktree && (busyInWorktree ? (
-            <div className="composer-warning">
-              <AlertTriangle size={13} />
-              <span>O agente está trabalhando no worktree desta issue. Pare-o antes de excluir: o worktree sai junto com a issue.</span>
-            </div>
-          ) : (
-            <p>
-              O worktree <span className="mono">{homePath(worktree.root, home)}</span> sai junto; a branch <span className="mono">{worktreeBranch(worktree)}</span>{' '}
-              continua nos repositórios. Se ele tiver alterações sem commit (ou arquivos fora dos repositórios), a exclusão para e avisa:
-              remova-o antes por Mais ações › Remover worktree, que mostra o que se perde. Feche os terminais e editores abertos nessa pasta.
-            </p>
-          ))}
-        </ConfirmDialog>
-      )}
 
       {worktree && removingWorktree === worktree.createdAt && (
         <RemoveWorktreeDialog issueId={issue.id} worktree={worktree} onClose={() => setRemovingWorktree(null)} />

@@ -7,18 +7,19 @@ import {
   EFFORT_LABEL, MAX_IMAGES, PERMISSION_HELP, PERMISSION_LABEL, type Activity, type AgentSession as Session, type Repo, type SessionSettings,
   type Worktree,
 } from '../../shared/types.ts';
+import { finishTerminalSession, resumeInTerminal } from '../actions.ts';
 import { api, type SettingsInput } from '../api.ts';
 import { setting, useAccountConfig } from '../claudeConfig.ts';
 import type { PendingImage } from '../images.ts';
 import { terminalLabel, useIntegrations } from '../integrations.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { ago, duration, isUnder, modKey } from '../util.ts';
-import { sessionFolderLabel, sessionRepos, worktreeBranch } from '../worktree.ts';
+import { lostWorktree, sessionFolderLabel, sessionRepos, worktreeBranch } from '../worktree.ts';
 import { Cost, usesSubscription } from './AccountsView.tsx';
 import { ChangesView } from './ChangesView.tsx';
 import { AccountAvatar, OrbitMark, SessionBadge } from './icons.tsx';
 import { AttachButton, DropHint, ImageTray, SentImages, useImageAttachments } from './Images.tsx';
-import { ConfirmDialog } from './modals.tsx';
+import { ResumeTerminalDialog } from './modals.tsx';
 import { OpenMenu } from './OpenMenu.tsx';
 import { EffortPicker, ModelPicker, PermissionPicker, modelLabel } from './SessionSettings.tsx';
 import { AutoTextarea, Kbd, Markdown, RepoChip } from './ui.tsx';
@@ -91,16 +92,8 @@ export const AgentSessionView = memo(function AgentSessionView({ session }: { se
   const repos = useWorkspaceRepos();
   const account = useStore((s) => s.accounts.find((a) => a.id === session.accountId));
   const status = useStore((s) => s.accountStatus[session.accountId]);
-  // O worktree desta sessão saiu da issue (removido, ou trocado por um novo, com outra branch) ou a issue foi excluída,
-  // o que remove o worktree antes (o servidor não exclui uma issue que ainda tem um): como no servidor, a conversa não
-  // continua nele. Sem issue, a sessão foi aberta na pasta de um worktree, e vale a pasta.
-  const worktreeLost = useStore((s): 'issue' | 'worktree' | null => {
-    if (!session.worktree || !session.issueId) return null;
-    const issue = s.issues.find((i) => i.id === session.issueId);
-    if (!issue) return 'issue';
-    // Uma remoção que parou no meio também conta: até ela terminar, nenhuma sessão roda nele.
-    return issue.worktree?.createdAt !== session.worktree.createdAt || issue.worktree.removing ? 'worktree' : null;
-  });
+  // O worktree desta sessão saiu da issue, ou a issue foi excluída: como no servidor, a conversa não continua nele.
+  const worktreeLost = useStore((s) => lostWorktree(session, s.issues));
   const worktreeGone = worktreeLost !== null;
   const { activities, load, retry } = useActivities(session.id);
   const scroller = useRef<HTMLDivElement>(null);
@@ -158,8 +151,7 @@ export const AgentSessionView = memo(function AgentSessionView({ session }: { se
   const openInTerminal = async () => {
     setResuming(true);
     try {
-      await api.resumeInTerminal(session.id);
-      toast(`Conversa aberta no ${terminal}.`, 'success');
+      await resumeInTerminal(session.id, terminal);
     } finally {
       setResuming(false);
     }
@@ -170,10 +162,8 @@ export const AgentSessionView = memo(function AgentSessionView({ session }: { se
   const finish = async () => {
     setFinishing(true);
     try {
-      await api.sync(session.id).catch(() => undefined);
-      await api.finish(session.id);
+      await finishTerminalSession(session.id);
       await reload().catch(() => undefined);
-      toast('Sessão marcada como concluída.', 'success');
     } catch {
       /* o aviso de erro já apareceu */
     } finally {
@@ -336,21 +326,7 @@ export const AgentSessionView = memo(function AgentSessionView({ session }: { se
         </div>
       ))}
 
-      {askResume && (
-        <ConfirmDialog
-          title="Abrir outra janela do terminal?"
-          tone="primary"
-          confirmLabel="Abrir outra janela"
-          busyLabel="Abrindo…"
-          onConfirm={openInTerminal}
-          onClose={() => setAskResume(false)}
-        >
-          <p>Esta sessão já foi aberta no terminal. Se aquela janela ainda estiver aberta, continue por lá.</p>
-          <p>
-            Duas janelas na mesma conversa gravam o mesmo histórico ao mesmo tempo e o embaralham. Abra outra só se a primeira já foi fechada.
-          </p>
-        </ConfirmDialog>
-      )}
+      {askResume && <ResumeTerminalDialog onConfirm={openInTerminal} onClose={() => setAskResume(false)} />}
     </div>
   );
 });

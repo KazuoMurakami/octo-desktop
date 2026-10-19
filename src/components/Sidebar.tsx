@@ -1,13 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronDown, ChevronRight, FolderGit2, FolderPlus, Inbox, KeyRound, Search, Settings2, SlidersHorizontal, Sparkles, SquareTerminal, X } from 'lucide-react';
-import type { UpdateInfo } from '../../shared/types.ts';
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
+import {
+  Bot, ChevronDown, ChevronRight, FolderGit2, FolderPlus, Inbox, KeyRound, Search, Settings2, SlidersHorizontal, Sparkles, SquareTerminal, Unplug, X,
+} from 'lucide-react';
+import type { UpdateInfo, Workspace } from '../../shared/types.ts';
 import { useShallow } from 'zustand/react/shallow';
 import { api } from '../api.ts';
 import { openClaudeIn } from '../integrations.ts';
 import { defaultAccountId, useStore, useWorkspace, useWorkspaceRepos, type View } from '../store.ts';
 import { hue, modKey, repoGroups, shortRepoName } from '../util.ts';
 import { loginHint } from './AccountsView.tsx';
+import { openContextMenu, type CloseReason } from './ContextMenu.tsx';
 import { AccountAvatar, OrbitMark } from './icons.tsx';
+import { groupMenu, repoMenu, workspaceMenu } from './menus.tsx';
 import { Kbd, Menu } from './ui.tsx';
 
 const NAV: { view: View; label: string; icon: typeof Inbox }[] = [
@@ -56,11 +60,26 @@ export function Sidebar({ inert = false, drawer = false }: { inert?: boolean; dr
     void openClaudeIn(workspace.id).finally(() => setTimeout(() => setLaunching(false), 2000));
   };
 
+  /**
+   * As ações de uma pasta. Aberto num item da lista do seletor, ele fecha junto quando uma ação é escolhida e no Tab,
+   * como o próprio seletor: o foco volta para o botão dele, e o Tab segue dali (Esc fecha só o menu de cima).
+   */
+  const workspaceMenuOptions = (w: Workspace, anchor?: HTMLElement, closeSwitcher?: () => void) => ({
+    label: `Ações da pasta ${w.name}`,
+    anchor,
+    // Desconectada por outra janela com o menu aberto, ele fecha: o botão do seletor continua na tela, já com outra pasta.
+    alive: () => useStore.getState().workspaces.some((x) => x.id === w.id),
+    onClose: (reason: CloseReason) => {
+      if (reason === 'select' || reason === 'tab') closeSwitcher?.();
+    },
+  });
+
   const repoRow = (repo: (typeof repos)[number], nested: boolean) => (
     <button
       key={repo.id}
       className={`side-repo${repoFilter === repo.id ? ' is-active' : ''}${nested ? ' is-nested' : ''}`}
       onClick={() => filterBy(repo.id)}
+      onContextMenu={(e) => openContextMenu(e, () => repoMenu(repo), { label: `Ações de ${shortRepoName(repo)}` })}
       title={repo.absPath}
       aria-pressed={repoFilter === repo.id}
     >
@@ -83,6 +102,7 @@ export function Sidebar({ inert = false, drawer = false }: { inert?: boolean; dr
               <ChevronDown size={14} className="dim" />
             </>
           }
+          onContextMenu={(e) => workspace && openContextMenu(e, () => workspaceMenu(workspace), workspaceMenuOptions(workspace))}
           items={[
             ...workspaces.map((w) => ({
               key: w.id,
@@ -91,8 +111,19 @@ export function Sidebar({ inert = false, drawer = false }: { inert?: boolean; dr
               icon: <span className="ws-mark is-small">{w.key.slice(0, 2)}</span>,
               selected: w.id === workspace?.id,
               onSelect: () => selectWorkspace(w.id),
+              onContextMenu: (e: MouseEvent<HTMLElement>, anchor: HTMLElement, closeSwitcher: () => void) =>
+                openContextMenu(e, () => workspaceMenu(w), workspaceMenuOptions(w, anchor, closeSwitcher)),
             })),
             { key: 'new', label: 'Conectar outra pasta…', icon: <FolderPlus size={14} />, onSelect: () => set({ modal: { kind: 'workspace' } }) },
+            ...(workspace
+              ? [{
+                  key: 'disconnect',
+                  label: 'Desconectar esta pasta…',
+                  icon: <Unplug size={14} />,
+                  danger: true,
+                  onSelect: () => set({ modal: { kind: 'disconnect', workspaceId: workspace.id } }),
+                }]
+              : []),
           ]}
         />
         <button ref={closeRef} type="button" className="icon-btn side-close" aria-label="Fechar navegação" title="Fechar (Esc)" onClick={() => set({ navOpen: false })}>
@@ -137,6 +168,7 @@ export function Sidebar({ inert = false, drawer = false }: { inert?: boolean; dr
                     className="side-group-head"
                     aria-expanded={!isCollapsed}
                     onClick={() => setCollapsed((c) => ({ ...c, [group.rel]: !isCollapsed }))}
+                    onContextMenu={(e) => openContextMenu(e, () => groupMenu(workspace.id, group), { label: `Ações da pasta ${group.rel}` })}
                   >
                     {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
                     <span>{group.rel}</span>

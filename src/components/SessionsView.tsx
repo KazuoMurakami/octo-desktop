@@ -6,7 +6,9 @@ import { useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { ago, money } from '../util.ts';
 import { sessionFolderLabel, worktreeBranch } from '../worktree.ts';
 import { Cost, usesSubscription } from './AccountsView.tsx';
+import { openContextMenu } from './ContextMenu.tsx';
 import { AccountAvatar, OrbitMark, SessionBadge } from './icons.tsx';
+import { sessionMenu } from './menus.tsx';
 import { RepoChip } from './ui.tsx';
 
 /** Visão geral do trabalho dos agentes — equivalente às páginas de agente do Linear. */
@@ -71,6 +73,9 @@ export function SessionsView() {
                 className="session-row"
                 // Com issue, abre a issue já nesta sessão (e não na mais recente).
                 onClick={() => set(issue ? { openIssueId: issue.id, openSessionId: session.id } : { openSessionId: session.id })}
+                onContextMenu={(event) =>
+                  openContextMenu(event, () => sessionMenu(session), { label: `Ações da sessão ${issue?.identifier ?? session.title}` })
+                }
               >
                 <AccountAvatar account={account} size={22} />
                 <div className="session-main">

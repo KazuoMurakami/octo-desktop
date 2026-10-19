@@ -3,9 +3,9 @@ import { createPortal } from 'react-dom';
 import {
   Bot, Code2, FileDiff, FileText, FolderGit2, FolderPlus, Inbox, Keyboard, KeyRound, Plus, RefreshCw, Settings2, SlidersHorizontal, SquareTerminal,
 } from 'lucide-react';
-import { api } from '../api.ts';
+import { rescan } from '../actions.ts';
 import { openClaudeIn } from '../integrations.ts';
-import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
+import { useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { isMac, modKey, repoGroups } from '../util.ts';
 import { StatusIcon } from './icons.tsx';
 import { openInEditor } from './OpenMenu.tsx';
@@ -55,7 +55,7 @@ function Palette() {
         id: 'scan', section: 'Ações', label: 'Reescanear repositórios', icon: <RefreshCw size={14} />,
         run: () => {
           set({ paletteOpen: false });
-          if (workspace) void api.scan(workspace.id).then((r) => toast(`${r.length} repositórios encontrados.`, 'success'));
+          if (workspace) void rescan(workspace).catch(() => undefined);
         },
       },
       { id: 'connect', section: 'Ações', label: 'Conectar outra pasta', icon: <FolderPlus size={14} />, run: go({ modal: { kind: 'workspace' } }) },
@@ -187,6 +187,8 @@ function Palette() {
 // ---------------------------------------------------------------- atalhos de teclado
 
 function shortcutGroups(mod: string): { title: string; keys: [string, string][] }[] {
+  // O Chromium não abre o menu do botão direito pelo Shift+F10 no macOS (lá vale o Ctrl+clique).
+  const contextMenu: [string, string][] = isMac() ? [] : [['Shift F10', 'Abre as ações do item focado, como o botão direito (a tecla Menu também)']];
   return [
     {
       title: 'Em qualquer tela',
@@ -195,6 +197,7 @@ function shortcutGroups(mod: string): { title: string; keys: [string, string][] 
         ['C', 'Nova issue'],
         ['?', 'Mostrar estes atalhos'],
         ['Esc', 'Fecha a paleta, o menu, o modal ou o painel aberto, um de cada vez'],
+        ...contextMenu,
       ],
     },
     {
@@ -213,6 +216,7 @@ function shortcutGroups(mod: string): { title: string; keys: [string, string][] 
       keys: [
         ['↑ ↓', 'Move o destaque'],
         ['Enter', 'Escolhe o item destacado'],
+        ['→ ←', 'Abre e fecha um submenu, como Status ▸'],
         ['Tab', 'Sai do menu'],
       ],
     },

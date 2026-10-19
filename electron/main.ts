@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { app, BrowserWindow, clipboard, dialog, Menu, powerMonitor, session, shell } from 'electron';
 import { apiToken, findRunningServer } from '../server/instance.ts';
 import { DATA_DIR } from '../server/paths.ts';
+import { editMenuPopupOptions, editMenuTemplate } from './contextMenu.ts';
 
 type Server = typeof import('../server/app.ts');
 type Store = typeof import('../server/store.ts');
@@ -316,6 +317,14 @@ function createWindow(): void {
     if (isAppOrigin(url)) return;
     event.preventDefault();
     openExternal(url);
+  });
+  // Botão direito num campo de texto ou sobre texto selecionado: Recortar, Copiar, Colar e Selecionar tudo. Os menus
+  // da própria interface (cards, repositórios, sessões) cancelam o evento na página, e aí este nem chega. Aberto pelo
+  // teclado (Shift+F10, tecla Menu), ele aparece no campo, e não onde está o ponteiro.
+  created.webContents.on('context-menu', (_event, params) => {
+    if (!isAppOrigin(params.frameURL || params.pageURL)) return;
+    const template = editMenuTemplate(params);
+    if (template.length) Menu.buildFromTemplate(template).popup({ window: created, ...editMenuPopupOptions(params) });
   });
 
   created.on('close', (event) => {

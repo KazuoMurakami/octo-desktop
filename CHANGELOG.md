@@ -17,6 +17,8 @@
 - Worktrees por issue, com nomes curtos: **Trabalhar num worktree** (ao delegar, ou ligado por padrão no workspace) cria uma pasta em `~/.octo/worktrees` com cada repositório da issue numa branch como `prj-12-checkout-pix`, a partir da branch padrão atualizada ou da branch atual. O `.worktreeinclude` leva o `.env` e afins, as sessões seguintes da issue continuam ali, e remover o worktree mantém as branches.
 - Sessões no terminal: **Sincronizar** traz o andamento para o Octo e **Marcar como concluída** fecha a sessão. Na aba Mudanças, o que já estava alterado antes da sessão começar aparece separado.
 - Teclado: paleta de comandos (Ctrl/⌘ K), lista de atalhos (`?`) e Esc que fecha uma camada de cada vez. Menus, diálogos e o quadro funcionam com teclado e leitor de tela.
+- Menus do botão direito (também pelo Shift+F10 e pela tecla Menu) em pastas, repositórios, pastas de grupo, cards e linhas de issue e sessões, com submenus de status e prioridade. Campos de texto e texto selecionado ganham Recortar, Copiar, Colar e Selecionar tudo no app desktop.
+- **Desconectar esta pasta…** no seletor de pastas (e no botão direito de cada uma): a pasta sai do Octo com as issues e as sessões dela, sem apagar nada do disco.
 - Nada se perde: título e descrição da issue são salvos enquanto você digita, e fechar um formulário com texto pede confirmação.
 - Contas novas herdam suas preferências do Claude Code (`settings.json` sem chaves de API, `CLAUDE.md`, skills, agentes e comandos), mas não o login.
 - Se o Claude Code sumir, ou se uma atualização automática deixar o executável quebrado, o Octo explica o que houve e como resolver.

@@ -5,6 +5,7 @@ import { api, authenticate, connect } from './api.ts';
 import { AccountsView } from './components/AccountsView.tsx';
 import { ClaudeConfigView } from './components/ClaudeConfigView.tsx';
 import { CommandPalette, ShortcutsHelp } from './components/CommandPalette.tsx';
+import { ContextMenuHost, closeContextMenu } from './components/ContextMenu.tsx';
 import octoLogo from './assets/octo-logo.png';
 import octoMark from './assets/octo-mark.png';
 import { Drawer } from './components/IssuePanel.tsx';
@@ -14,6 +15,7 @@ import { ReposView } from './components/ReposView.tsx';
 import { SessionsView } from './components/SessionsView.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { CrashScreen, ErrorBoundary, Kbd, Toasts, escapeTopLayer, hasLayer, useEscapeLayer } from './components/ui.tsx';
+import { useIntegrations } from './integrations.ts';
 import { toast, useStore, useWorkspace, type Toast } from './store.ts';
 import { isTyping, leaveTextField, modKey } from './util.ts';
 
@@ -82,6 +84,7 @@ export function App() {
   return (
     <>
       {content}
+      <ContextMenuHost />
       <Toasts />
     </>
   );
@@ -93,12 +96,16 @@ function Workbench() {
   const view = useStore((s) => s.view);
   const navWanted = useStore((s) => s.navOpen);
   const drawerKey = useStore((s) => s.openIssueId ?? s.openSessionId);
+  // Como no Drawer: o painel só aparece (e deixa o resto inerte) se a issue ou a sessão ainda existe. Um id que ficou
+  // para trás, de uma issue excluída por outra janela, não trava a tela sem painel.
+  const drawerOpen = useStore((s) => s.issues.some((i) => i.id === s.openIssueId) || s.sessions.some((x) => x.id === s.openSessionId));
   const narrow = useMediaQuery('(max-width: 900px)');
   const navOpen = navWanted && narrow;
-  const drawerOpen = drawerKey !== null;
   const toggleRef = useRef<HTMLButtonElement>(null);
 
   useNavigationDrawer(navOpen, narrow, toggleRef);
+  // Os menus do botão direito mostram o terminal e o editor na hora em que abrem: a lista já fica carregada.
+  useIntegrations();
 
   return (
     <div className={`app${navOpen ? ' is-nav-open' : ''}`}>
@@ -370,6 +377,9 @@ function useMenuCommands(): void {
         toast('Feche a janela aberta para ver as preferências.');
         return;
       }
+      // Um menu do botão direito aberto fecha antes, e o foco volta para o card ou a linha dele: é para lá que o modal o
+      // devolve ao fechar.
+      closeContextMenu();
       s.set({ modal: { kind: 'preferences' }, paletteOpen: false });
     };
     window.addEventListener('octo:menu', onMenu);

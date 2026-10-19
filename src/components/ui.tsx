@@ -86,6 +86,27 @@ export function useDialog(ref: RefObject<HTMLElement | null>): void {
   }, [ref, opener]);
 }
 
+/**
+ * Para onde vai o foco se `el` sair da tela (a issue excluída, ou cancelada com as canceladas ocultas): o item focável
+ * mais perto dele no mesmo grupo (o card de baixo, o de cima ou, sem nenhum, o botão de nova issue da coluna) e, sem
+ * nenhum, no grupo de fora. Medido enquanto `el` ainda está na tela; a função devolvida, chamada depois, só age se o
+ * foco se perdeu (ficou no body), e vale o primeiro desses itens que continuar à vista.
+ */
+export function focusNearby(el: HTMLElement): () => void {
+  const candidates: HTMLElement[] = [];
+  for (let group = el.parentElement; group && group !== document.body && candidates.length < 4; group = group.parentElement) {
+    const near = [...group.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((x) => x.tabIndex >= 0 && !el.contains(x) && !x.contains(el));
+    const after = near.find((x) => el.compareDocumentPosition(x) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const before = near.findLast((x) => el.compareDocumentPosition(x) & Node.DOCUMENT_POSITION_PRECEDING);
+    for (const x of [after, before]) if (x && !candidates.includes(x)) candidates.push(x);
+  }
+  return () => {
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    candidates.find((x) => x.isConnected && !x.closest('[inert]') && x.getClientRects().length > 0)?.focus();
+  };
+}
+
 /** Tab e Shift+Tab circulam dentro do diálogo, sem escapar para o que está por trás. */
 export function trapTab(event: ReactKeyboardEvent<HTMLElement>): void {
   if (event.key !== 'Tab') return;
@@ -119,6 +140,11 @@ export interface MenuItem {
   selected?: boolean;
   danger?: boolean;
   onSelect: () => void;
+  /**
+   * Botão direito no item (ou Shift+F10 com ele destacado): abre o menu de ações dele. `anchor` é o item na tela, e
+   * `closeMenu` fecha este menu (depois de uma ação escolhida lá, por exemplo).
+   */
+  onContextMenu?: (event: ReactMouseEvent<HTMLElement>, anchor: HTMLElement, closeMenu: () => void) => void;
 }
 
 /**
@@ -127,7 +153,7 @@ export interface MenuItem {
  * setas e Home/End movem o destaque, Esc fecha e devolve o foco ao gatilho, Tab sai do menu.
  */
 export function Menu({
-  trigger, items, multi = false, filter = false, width = 240, align = 'start', className = '', label,
+  trigger, items, multi = false, filter = false, width = 240, align = 'start', className = '', label, onContextMenu,
 }: {
   trigger: ReactNode;
   items: MenuItem[];
@@ -138,6 +164,8 @@ export function Menu({
   className?: string;
   /** Nome do gatilho para leitores de tela (e dica ao passar o mouse); use em gatilhos só com ícone. */
   label?: string;
+  /** Botão direito no gatilho (aberto, o menu suspenso fecha antes, e o foco fica no gatilho). */
+  onContextMenu?: (event: ReactMouseEvent<HTMLButtonElement>) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -169,7 +197,10 @@ export function Menu({
     if (!open) return;
     (filterRef.current ?? listRef.current)?.focus({ preventScroll: true });
     const close = (event: MouseEvent) => {
-      if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      // O menu do botão direito de um item, aberto por cima deste, não conta como fora.
+      if (target instanceof Element && target.closest('[data-context-menu]')) return;
+      if (!menuRef.current?.contains(target) && !triggerRef.current?.contains(target)) setOpen(false);
     };
     document.addEventListener('mousedown', close);
     return () => document.removeEventListener('mousedown', close);
@@ -248,6 +279,15 @@ export function Menu({
             show();
           }
         }}
+        // O botão direito no gatilho fecha este menu suspenso: o menu do botão direito (o dele ou o da linha em volta,
+        // como em "Abrir em…") não abre por cima dele.
+        onContextMenu={(event) => {
+          if (open) {
+            setOpen(false);
+            triggerRef.current?.focus({ preventScroll: true });
+          }
+          onContextMenu?.(event);
+        }}
       >
         {trigger}
       </button>
@@ -281,6 +321,16 @@ export function Menu({
               aria-multiselectable={multi || undefined}
               aria-activedescendant={filter ? undefined : activeId}
               tabIndex={filter ? undefined : -1}
+              // Pelo mouse, vale o item clicado; pelo teclado (o foco fica na lista), o destacado.
+              onContextMenu={(event) => {
+                const option = event.target instanceof Element ? event.target.closest('[role="option"]') : null;
+                const index = option ? itemRefs.current.indexOf(option as HTMLButtonElement) : current;
+                const item = visible[index];
+                const anchor = itemRefs.current[index];
+                if (!item?.onContextMenu || !anchor) return;
+                if (index !== current) setActive(index);
+                item.onContextMenu(event, anchor, () => close(true));
+              }}
             >
               {visible.map((item, index) => (
                 <button
