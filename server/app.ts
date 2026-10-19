@@ -182,18 +182,23 @@ function allowedRules(value: unknown): string[] {
   if (rules.length > 50) throw new HttpError(400, 'Libere no máximo 50 ações de uma vez.');
   for (const rule of rules) {
     if (!/^[A-Za-z][\w.:-]*(\([\s\S]*\))?$/.test(rule)) throw new HttpError(400, `Regra de permissão inválida: ${rule.slice(0, 80)}`);
-    // Valeria para qualquer comando (ver refusedReason): o painel já mostra essas riscadas, sem caixa para marcar.
+    // O Octo não libera (ver refusedReason): o painel já mostra essas riscadas, sem caixa para marcar.
     const refused = refusedReason(rule);
-    if (refused) throw new HttpError(400, `Regra de permissão ampla demais: ${rule.slice(0, 80)} liberaria qualquer comando ${REFUSED[refused]}`);
+    if (refused) throw new HttpError(400, REFUSED[refused](rule.slice(0, 80)));
   }
   return rules;
 }
 
-/** O motivo e o que fazer, no fim da recusa de uma regra que liberaria qualquer comando. */
-const REFUSED: Record<RefusedReason, string> = {
-  empty: '(sem comando definido). Desmarque essa ação, ou responda sem liberar.',
-  program: '(o * está no lugar do programa). Desmarque essa ação, ou responda sem liberar.',
-  monitor: '(o Monitor roda comandos pelo shell). Libere o comando exato, numa regra Bash(...), ou responda sem liberar.',
+/** A recusa de uma regra que o Octo não libera: o motivo e o que fazer. */
+const REFUSED: Record<RefusedReason, (rule: string) => string> = {
+  empty: (rule) => `Regra de permissão ampla demais: ${rule} liberaria qualquer comando (sem comando definido). Desmarque essa ação, ou responda sem liberar.`,
+  program: (rule) => `Regra de permissão ampla demais: ${rule} liberaria qualquer comando (o * está no lugar do programa). Desmarque essa ação, ou responda sem liberar.`,
+  monitor: (rule) =>
+    `Regra de permissão ampla demais: ${rule} liberaria qualquer comando (o Monitor roda comandos pelo shell). Libere o comando exato, numa regra Bash(...), ou responda sem liberar.`,
+  domain: (rule) =>
+    `Regra de permissão ampla demais: ${rule} liberaria qualquer site (e abriria a rede dos comandos no sandbox para qualquer endereço). Desmarque essa ação, ou responda sem liberar.`,
+  compound: (rule) =>
+    `Regra de permissão que não dá para liberar por aqui: ${rule} tem partes que o Octo não consegue liberar uma a uma (o Claude Code confere cada parte do comando separadamente, e uma regra com ele inteiro não valeria). Para seguir, continue no terminal, onde o Claude Code pergunta parte por parte, ou peça ao agente para rodar as partes separadamente.`,
 };
 
 function budget(value: unknown): number | null {

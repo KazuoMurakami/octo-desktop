@@ -911,6 +911,11 @@ fieldset.delegate { border: 0; margin: 0; padding: 0; min-width: 0; }
 .denial.is-refused code { text-decoration: line-through; opacity: 0.6; }
 .denial.is-refused .denial-warning { color: var(--danger); }
 .denial-blocked { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* As regras das partes de um comando ficam juntas, embaixo dele: o comando inteiro aparece uma vez só, numa linha
+   (inteiro no title), e a barra do lado mostra que as caixas são dele. */
+.denial-group { display: flex; flex-direction: column; gap: 2px; min-width: 0; margin: 4px 0; padding: 2px 0 2px 10px; border-left: 2px solid rgba(229, 184, 75, 0.35); }
+.denial-group-command { font-size: 11.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.denial-group-help { font-size: 11.5px; color: var(--text-3); }
 /* Numa janela estreita, os botões descem um embaixo do outro em vez de sair da caixa. */
 .denials-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .denials-help { margin: 0 0 8px; color: var(--text-2); font-size: 12.5px; }

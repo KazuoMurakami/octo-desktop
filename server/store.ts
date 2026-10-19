@@ -7,6 +7,7 @@ import {
 } from '../shared/types.ts';
 import { ensureDataDir } from './instance.ts';
 import { DATA_DIR, DB_FILE, RUNTIME_DIR, SESSIONS_DIR } from './paths.ts';
+import { cutPoint } from './system.ts';
 
 export { DATA_DIR, RUNTIME_DIR };
 
@@ -103,6 +104,20 @@ function tooDeep(value: object, limit: number): boolean {
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 
+/** Até onde vai cada texto que fica do input de uma ação bloqueada. */
+const MAX_DENIAL_TEXT = 4096;
+
+/**
+ * O input de uma ação bloqueada: só os textos do primeiro nível (o comando, o endereço, o arquivo), cortados sem
+ * separar um par substituto. É o que o servidor e o painel leem dele. Versões anteriores guardavam o tool_input
+ * inteiro, como veio do CLI, e o de uma ferramenta MCP pode ter qualquer profundidade.
+ */
+export function denialInput(input: unknown): Record<string, string> {
+  if (!isObject(input)) return {};
+  const texts = Object.entries(input).filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+  return Object.fromEntries(texts.map(([key, value]) => [key, value.slice(0, cutPoint(value, MAX_DENIAL_TEXT))]));
+}
+
 /**
  * Lê o banco e confere o que não dá para consertar: listas e preferências no formato certo, o id e os textos que
  * identificam cada item, e o aninhamento. JSON válido assim, num formato que nenhuma versão do Octo gravou (editado
@@ -114,6 +129,15 @@ function parseDb(text: string): Partial<Db> {
   // A marca de UTF-8 (BOM) que o Bloco de Notas e o PowerShell põem no começo não faz parte do JSON.
   const data = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) as unknown;
   if (!isObject(data)) throw new Error('o conteúdo não é um objeto JSON');
+  // O input das ações bloqueadas fica fora do limite: versões anteriores o gravavam inteiro (ver denialInput), e
+  // recusar o banco por causa dele voltaria a cópia de segurança, perdendo o trabalho feito depois dela. Antes de
+  // medir, fica só o que a migração guardaria dele.
+  if (Array.isArray(data.sessions)) {
+    for (const session of data.sessions) {
+      if (!isObject(session) || !Array.isArray(session.pendingDenials)) continue;
+      for (const denial of session.pendingDenials) if (isObject(denial)) denial.input = denialInput(denial.input);
+    }
+  }
   if (tooDeep(data, MAX_NESTING)) throw new Error(`o conteúdo tem mais de ${MAX_NESTING} níveis de listas e objetos`);
   for (const key of LISTS) {
     const list = data[key];
@@ -293,7 +317,7 @@ const FIELDS: Record<List, Shape> = {
     issueId: textOr(null), accountId: textOr(''), claudeSessionId: textOr(''), mode: textOr(''), state: textOr(''), activeModel: textOr(null),
     title: textOr(''), cwd: textOr(''), startedAt: textOr(''), updatedAt: textOr(''), endedAt: textOr(null), costUsd: numberOr(0),
     durationMs: numberOr(0), turns: numberOr(0), touchedRepoIds: textList,
-    pendingDenials: objectList(shape({ tool: textOr(''), rule: textOr(''), input: (input) => (isObject(input) ? input : {}) })),
+    pendingDenials: objectList(shape({ tool: textOr(''), rule: textOr(''), input: denialInput })),
     lastError: textOr(null), baselineAt: textOr(null), worktree, model: textOr(null), effort: textOr(null), agent: textOr(null),
     fallbackModel: textOr(null), addDirs: textList, maxBudgetUsd: numberOr(null),
   }),

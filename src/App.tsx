@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import { AlertTriangle, Check, LogIn, Menu as MenuIcon, RefreshCw, Search, X } from 'lucide-react';
+import { blockedActions } from '../shared/permissions.ts';
 import type { AccountStatus, AgentSession, ClaudeAccount } from '../shared/types.ts';
 import { api, authenticate, connect } from './api.ts';
 import { AccountsView } from './components/AccountsView.tsx';
@@ -282,9 +283,16 @@ function alertSession(session: AgentSession): void {
   let body: string;
   let tone: Toast['tone'];
   if (session.state === 'awaiting_input') {
-    const count = session.pendingDenials.length;
+    // Ações, e não regras: um comando encadeado bloqueado vira uma regra por parte (ver blockedActions).
+    const actions = blockedActions(session.pendingDenials);
+    const one = actions.length === 1 ? actions[0] : null;
+    const what = one ? (one.rules.length === 1 ? one.rules[0] : (one.value ?? one.rules.join(', '))) : '';
     title = `${name} aguarda você`;
-    body = count === 1 ? `Precisa de permissão para ${session.pendingDenials[0].rule}.` : `Precisa de permissão para ${count} ações.`;
+    body = one
+      ? `Precisa de permissão para ${what.length > 140 ? `${what.slice(0, 139)}…` : what}.`
+      : actions.length
+        ? `Precisa de permissão para ${actions.length} ações.`
+        : 'Precisa de você para continuar.';
     tone = 'info';
   } else if (session.state === 'complete') {
     title = `${name}: o agente terminou`;

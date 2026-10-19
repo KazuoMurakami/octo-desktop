@@ -8,13 +8,14 @@ import {
   type Activity, type AgentSession, type ClaudeAccount, type Issue, type PermissionDenial, type PermissionMode, type Repo, type SessionSettings,
   type Workspace, type Worktree,
 } from '../shared/types.ts';
+import { bashParts, blockedActions } from '../shared/permissions.ts';
 import { dirtyEntries } from './changes.ts';
 import { claudeEnv, requireClaude, type ClaudeCommand } from './claude.ts';
 import { broadcast } from './events.ts';
 import { imageBlocks, saveImages, saveTranscriptImages, type ParsedImage } from './images.ts';
 import { HttpError, addHistory, commitIssue, commitSession, now, requireFolder, workspaceRepos } from './model.ts';
 import { describeRepos } from './scanner.ts';
-import { appendActivity, db, readActivities, save, writeActivities, writeBaseline } from './store.ts';
+import { appendActivity, db, denialInput, readActivities, save, writeActivities, writeBaseline } from './store.ts';
 import { cutPoint, describeSpawnError, fitsCommandLine, shrinkToFit } from './system.ts';
 import { openClaudeTerminal } from './terminal.ts';
 import { sessionRepos, worktreeCwd } from './worktrees.ts';
@@ -289,20 +290,23 @@ function summarizeTool(session: AgentSession, name: string, input: Record<string
 }
 
 /**
- * Regra que libera a ação bloqueada (vai no permissions.allow do --settings), o mais restrita que o Claude
- * Code entende. Sem como restringir, fica só o nome da ferramenta, que vale para todo uso dela: o painel
- * avisa (ver ruleKind, em shared/permissions.ts), e o Bash e o PowerShell sozinhos o servidor nem aceita.
+ * Regras que liberam a ação bloqueada (vão no permissions.allow do --settings), as mais restritas que o Claude
+ * Code entende. Um comando do Bash vira uma regra por parte, sem os wrappers, como o Claude Code o confere (ver
+ * bashParts, em shared/permissions.ts); o que a divisão não modela fica numa regra só, com o comando inteiro, que
+ * o painel mostra recusada. Sem como restringir, fica só o nome da ferramenta, que vale para todo uso dela: o
+ * painel avisa (ver ruleKind), e o Bash e o PowerShell sozinhos o servidor nem aceita.
  */
-function denialRule(tool: string, input: Record<string, any>): string {
+function denialRules(tool: string, input: Record<string, any>): string[] {
   const command = typeof input.command === 'string' ? input.command : null;
   // O Monitor roda o comando pelo shell, com as regras do Bash: liberar o "Monitor" valeria para qualquer comando.
-  if (tool === 'Monitor' && command !== null) return `Bash(${command})`;
-  if ((tool === 'Bash' || tool === 'PowerShell') && command !== null) return `${tool}(${command})`;
+  if ((tool === 'Bash' || tool === 'Monitor') && command !== null) return (bashParts(command) ?? [command]).map((part) => `Bash(${part})`);
+  // O comando do PowerShell fica inteiro: com mais de uma parte, o painel o mostra recusado (ver refusedReason).
+  if (tool === 'PowerShell' && command !== null) return [`PowerShell(${command})`];
   if (tool === 'WebFetch') {
     const host = fetchHost(input.url);
-    if (host) return `WebFetch(domain:${host})`;
+    if (host) return [`WebFetch(domain:${host})`];
   }
-  return tool;
+  return [tool];
 }
 
 /**
@@ -418,11 +422,14 @@ function handleEvent(session: AgentSession, run: Run | null, event: any): void {
     session.costUsd += Number(event.total_cost_usd ?? 0);
     session.durationMs += Number(event.duration_ms ?? 0);
     session.turns += Number(event.num_turns ?? 0);
-    const denials: PermissionDenial[] = (event.permission_denials ?? []).map((d: any) => ({
-      tool: d.tool_name,
-      input: d.tool_input ?? {},
-      rule: denialRule(d.tool_name, d.tool_input ?? {}),
-    }));
+    // Uma entrada por regra: as partes de um comando encadeado vêm com a mesma ação (ver denialRules e
+    // blockedActions). As regras saem do tool_input inteiro; na sessão fica só o que se lê dele (ver denialInput).
+    const denials: PermissionDenial[] = (Array.isArray(event.permission_denials) ? event.permission_denials : []).flatMap((d: any) => {
+      if (typeof d?.tool_name !== 'string' || !d.tool_name) return [];
+      const toolInput = d.tool_input && typeof d.tool_input === 'object' && !Array.isArray(d.tool_input) ? d.tool_input : {};
+      const input = denialInput(toolInput);
+      return denialRules(d.tool_name, toolInput).map((rule) => ({ tool: d.tool_name, input, rule }));
+    });
     session.pendingDenials = denials;
 
     const failed = event.is_error || (event.subtype && event.subtype !== 'success');
@@ -468,7 +475,9 @@ function onSessionSettled(session: AgentSession): void {
     issue.reviewPending = othersRunning && issue.status === 'in_progress';
   } else {
     if (session.state === 'awaiting_input') {
-      addHistory(issue, 'session', actor, session.pendingDenials.length === 1 ? 'aguarda permissão para 1 ação' : `aguarda permissão para ${session.pendingDenials.length} ações`);
+      // As regras das partes de um comando contam como uma ação só.
+      const count = blockedActions(session.pendingDenials).length;
+      addHistory(issue, 'session', actor, count === 1 ? 'aguarda permissão para 1 ação' : `aguarda permissão para ${count} ações`);
     } else if (session.state === 'error') {
       addHistory(issue, 'session', actor, 'encerrou a sessão com erro');
     }

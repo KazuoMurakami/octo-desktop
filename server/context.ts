@@ -29,11 +29,24 @@ interface Fence {
   length: number;
 }
 
-/** Linha que abre um bloco de código cercado (``` ou ~~~, com ou sem a linguagem), como no Markdown. */
+/** Um marcador que não conta por estar dentro de um bloco de código, e a cerca que abriu esse bloco. */
+interface Fenced {
+  line: number;
+  marker: string;
+  /** Linha da cerca, a partir de 1. */
+  fenceLine: number;
+  fence: Fence;
+}
+
+/**
+ * Linha que abre um bloco de código cercado (``` ou ~~~, com ou sem a linguagem), como no Markdown. O regex casa só
+ * a cerca: as linhas são separadas no \n, então podem ter um CR, U+2028 ou U+2029 no meio, onde um `(.*)$` para o
+ * resto da linha pararia, voltando atrás crase por crase (numa linha de muitas crases, um tempo quadrático).
+ */
 function opens(line: string): Fence | null {
-  const match = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+  const match = /^[ \t]*(`{3,}|~{3,})/.exec(line);
   // Com crases, o que vem depois não pode ter outra crase: ```a``` é código no meio da linha, e não uma cerca.
-  if (!match || (match[1][0] === '`' && match[2].includes('`'))) return null;
+  if (!match || (match[1][0] === '`' && line.includes('`', match[0].length))) return null;
   return { char: match[1][0], length: match[1].length };
 }
 
@@ -59,28 +72,50 @@ function markerAt(line: string): { marker: string; lead: number } | null {
  * Os marcadores do bloco que contam: os que começam uma linha, como o Octo sempre os grava, fora de blocos de
  * código. Um marcador citado no meio de uma frase, ou num exemplo entre ``` ou ~~~, é só texto. Uma cerca que
  * nunca fecha não abre bloco de código: senão, uma cerca esquecida antes do bloco o esconderia, e cada geração
- * acrescentaria outro bloco no fim. `fenced` conta os marcadores ignorados por estarem dentro de um bloco de código.
+ * acrescentaria outro bloco no fim. Pelo mesmo motivo, uma cerca aberta dentro do bloco (depois de um início) que
+ * só fecharia depois da última linha que é só o fim dele acaba na primeira dessas linhas: versões anteriores, sem o
+ * closeFences, deixavam aberta a cerca das diretrizes, que engoliria o fim (o Octo sempre o grava assim, sozinho no
+ * começo da linha) e o texto do usuário até a próxima cerca dele. Uma cerca que fecha antes do último fim esconde o
+ * que tem dentro, como as outras: essas versões também não trocavam por texto um fim citado nas diretrizes.
+ * `fenced` traz os marcadores ignorados por estarem dentro de um bloco de código.
  */
-function structuralMarkers(content: string): { found: Found[]; fenced: number } {
+function structuralMarkers(content: string): { found: Found[]; fenced: Fenced[] } {
   const raw = content.split('\n');
   const lines = raw.map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
-  // O maior fechamento de cada tipo de cerca da linha i em diante: diz na hora se uma abertura fecha (e a leitura fica linear).
-  const longest: Record<string, Int32Array> = { '`': new Int32Array(lines.length + 1), '~': new Int32Array(lines.length + 1) };
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const end = closer(lines[i]);
-    for (const char of ['`', '~']) longest[char][i] = Math.max(longest[char][i + 1], end?.char === char ? end.length : 0);
-  }
+  const closers = lines.map(closer);
+  // O maior fechamento de cada tipo de cerca da linha i até a linha `last`: diz na hora se uma abertura fecha (e a leitura fica linear).
+  const longestUpTo = (last: number) => {
+    const longest: Record<string, Int32Array> = { '`': new Int32Array(last + 2), '~': new Int32Array(last + 2) };
+    for (let i = last; i >= 0; i--) {
+      const end = closers[i];
+      for (const char of ['`', '~']) longest[char][i] = Math.max(longest[char][i + 1], end?.char === char ? end.length : 0);
+    }
+    return longest;
+  };
+  const longest = longestUpTo(lines.length - 1);
+  // Para cada família (Octo e Nexo, na ordem de MARKERS), a última linha que é só o fim do bloco e os fechamentos até ela.
+  const lastEnds = MARKERS.map(([, end]) => {
+    const at = lines.lastIndexOf(end);
+    return { end, at, longest: longestUpTo(at) };
+  });
   const found: Found[] = [];
-  let fenced = 0;
+  const fenced: Fenced[] = [];
   let offset = 0;
   for (let i = 0; i < lines.length; offset += raw[i].length + 1, i++) {
     const fence = opens(lines[i]);
     if (fence && longest[fence.char][i + 1] >= fence.length) {
-      while (!closes(lines[i + 1], fence)) {
+      // Dentro do bloco (o último marcador que conta é um início), sem fechamento até o último fim: acaba no primeiro fim.
+      const last = found.at(-1);
+      const block = last?.kind === 'start' ? lastEnds[last.family === 'nexo' ? 1 : 0] : null;
+      const blockEnd = block && block.at > i && block.longest[fence.char][i + 1] < fence.length ? block.end : null;
+      const fenceLine = i + 1;
+      while (!closes(lines[i + 1], fence) && lines[i + 1] !== blockEnd) {
         offset += raw[i].length + 1;
         i++;
-        if (markerAt(lines[i])) fenced++;
+        const at = markerAt(lines[i]);
+        if (at) fenced.push({ line: i + 1, marker: at.marker, fenceLine, fence });
       }
+      if (lines[i + 1] === blockEnd) continue; // o fim conta: a próxima volta o lê como os outros marcadores
       offset += raw[i].length + 1;
       i++; // a linha que fecha
       continue;
@@ -114,12 +149,15 @@ const counted = (found: Found[], one: string, many: string, block = ''): string 
   `${found.length === 1 ? one : `${found.length} ${many}`}${block && ` ${block}`} (${lineList(found)})`;
 
 /** O que há de errado com os marcadores e como corrigir, com as linhas e a família (Octo ou Nexo) que estão no arquivo. */
-function damageMessage(found: Found[], fenced: number): string {
+function damageMessage(found: Found[], fenced: Fenced[]): string {
   const families = [...new Set(found.map((m) => m.family))];
   const label = (family: string) => (family === 'nexo' ? 'do Nexo' : 'do Octo');
   const leftovers = 'apague à mão o que sobrou do bloco antigo, conferindo se não há texto seu entre os marcadores';
   let problem: string;
   let fix = leftovers;
+  // O marcador que falta pode estar no arquivo, mas dentro de um bloco de código que não fecha antes dele (uma cerca
+  // esquecida aberta): o fim depois do único início, ou o início antes do único fim.
+  let hidden: Fenced | undefined;
   if (families.length > 1) {
     problem = `tem marcadores de duas versões do bloco: ${families.map((f) => `${label(f)} (${lineList(found.filter((m) => m.family === f))})`).join(' e ')}`;
   } else {
@@ -128,10 +166,12 @@ function damageMessage(found: Found[], fenced: number): string {
     const starts = found.filter((m) => m.kind === 'start');
     const ends = found.filter((m) => m.kind === 'end');
     if (!ends.length) {
-      problem = `tem ${counted(starts, 'o início', 'inícios', block)}, mas ${starts.length === 1 ? 'não o fim' : 'nenhum fim'}`;
+      if (starts.length === 1) hidden = fenced.find((m) => m.marker === end && m.line > starts[0].line);
+      problem = `tem ${counted(starts, 'o início', 'inícios', block)}, mas ${hidden ? `o fim (na linha ${hidden.line}) não conta` : starts.length === 1 ? 'não o fim' : 'nenhum fim'}`;
       if (starts.length === 1) fix = `recoloque o ${end} logo depois do bloco antigo, ou apague o bloco antigo à mão`;
     } else if (!starts.length) {
-      problem = `tem ${counted(ends, 'o fim', 'fins', block)}, mas ${ends.length === 1 ? 'não o início' : 'nenhum início'}`;
+      if (ends.length === 1) hidden = fenced.findLast((m) => m.marker === start && m.line < ends[0].line);
+      problem = `tem ${counted(ends, 'o fim', 'fins', block)}, mas ${hidden ? `o início (na linha ${hidden.line}) não conta` : ends.length === 1 ? 'não o início' : 'nenhum início'}`;
       if (ends.length === 1) fix = `recoloque o ${start} logo antes do bloco antigo, ou apague à mão o que sobrou dele`;
     } else if (starts.length === 1 && ends.length === 1) {
       problem = `tem ${counted(ends, 'o fim', 'fins', block)} antes do início (${lineList(starts)})`;
@@ -140,9 +180,14 @@ function damageMessage(found: Found[], fenced: number): string {
       fix = `${leftovers}, até sobrar um início e um fim`;
     }
   }
+  if (hidden) {
+    // Fechar o bloco de código resolve quando a cerca ficou aberta sem querer; num exemplo de propósito, vale o conserto de sempre.
+    problem += `: ele está dentro de um bloco de código aberto na linha ${hidden.fenceLine}, que não fecha antes dele`;
+    fix = `feche esse bloco de código antes da linha ${hidden.line} (com uma linha só com ${hidden.fence.char.repeat(hidden.fence.length)}), se ele devia acabar antes; senão, ${fix}`;
+  }
   const notes = [
     families.includes('nexo') ? 'Nexo é o nome antigo do Octo.' : '',
-    fenced ? 'Marcadores dentro de blocos de código (entre ``` ou ~~~) não contam.' : '',
+    fenced.length > (hidden ? 1 : 0) ? 'Marcadores dentro de blocos de código (entre ``` ou ~~~) não contam.' : '',
   ].filter(Boolean);
   return `O CLAUDE.md desta pasta ${problem}. Para gerar de novo, ${fix}.${notes.length ? ` ${notes.join(' ')}` : ''}`;
 }

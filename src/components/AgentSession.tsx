@@ -1,9 +1,9 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle, ChevronRight, CircleCheck, CornerDownLeft, FileDiff, FileEdit, FolderOpen, FilePlus, FileText, GitBranch, Globe, ListChecks,
   MessageSquare, RefreshCw, Search, ShieldQuestion, Square, SquareTerminal, TerminalSquare, Users, Wrench,
 } from 'lucide-react';
-import { refusedReason, ruleKind, type RefusedReason, type RuleKind } from '../../shared/permissions.ts';
+import { blockedActions, blockedValue, refusedReason, ruleKind, type RefusedReason, type RuleKind } from '../../shared/permissions.ts';
 import {
   EFFORT_LABEL, MAX_IMAGES, PERMISSION_HELP, PERMISSION_LABEL, type Activity, type AgentSession as Session, type PermissionDenial, type Repo,
   type SessionSettings, type Worktree,
@@ -457,26 +457,60 @@ function Collapsible({ summary, children, className }: { summary: string; childr
   );
 }
 
-/** Como seguir com o que não dá para liberar por aqui. */
-const REFUSED_HOW = 'Para seguir, continue no terminal, onde o Claude pergunta na hora, ou responda ao agente pedindo o comando exato.';
+/** O que está riscado: valeria para qualquer comando, para qualquer site, tem partes que o Octo não separa, ou uma mistura. */
+type RefusedGroup = 'any' | 'domain' | 'compound' | 'mixed';
 
-/** Por que a regra valeria para qualquer comando (ver refusedReason). */
+const REFUSED_GROUP: Record<RefusedReason, Exclude<RefusedGroup, 'mixed'>> = {
+  empty: 'any',
+  program: 'any',
+  monitor: 'any',
+  domain: 'domain',
+  compound: 'compound',
+};
+
+/** Como seguir com o que não dá para liberar por aqui. */
+const REFUSED_HOW: Record<RefusedGroup, string> = {
+  any: 'Para seguir, continue no terminal, onde o Claude pergunta na hora, ou responda ao agente pedindo o comando exato.',
+  domain: 'Para seguir, continue no terminal, onde o Claude pergunta na hora, ou responda ao agente pedindo o endereço exato.',
+  compound: 'Para seguir, continue no terminal, onde o Claude Code pergunta parte por parte, ou peça ao agente para rodar as partes separadamente.',
+  mixed: 'Para seguir, continue no terminal, onde o Claude pergunta na hora, ou responda ao agente.',
+};
+
+/** Por que o Octo não libera a regra (ver refusedReason). */
 const REFUSED_WHY: Record<RefusedReason, string> = {
   empty: 'A regra está sem comando definido, então valeria para qualquer comando, e o Octo não a libera.',
   program: 'O * está no lugar do programa, então a regra valeria para qualquer comando, e o Octo não a libera.',
   monitor: 'O Monitor roda comandos pelo shell, então liberá-lo valeria para qualquer comando, e o Octo não libera.',
+  domain: 'Só com curingas no lugar do domínio, a regra valeria para qualquer site e ainda abriria a rede dos comandos no sandbox para qualquer endereço, e o Octo não a libera.',
+  compound: 'O Claude Code confere cada parte de um comando encadeado separadamente, e este tem partes que o Octo não consegue separar para liberar uma a uma (como $( ), crases, subshells, laços, here-docs, ou partes demais).',
+};
+
+/** O aviso ao lado de uma regra recusada (o porquê inteiro fica no title). */
+const REFUSED_TEXT: Record<RefusedReason, string> = {
+  empty: 'Valeria para qualquer comando: não dá para liberar por aqui.',
+  program: 'Valeria para qualquer comando: não dá para liberar por aqui.',
+  monitor: 'Valeria para qualquer comando: não dá para liberar por aqui.',
+  domain: 'Valeria para qualquer site: não dá para liberar por aqui.',
+  compound: 'Tem partes que o Octo não consegue liberar uma a uma.',
 };
 
 /** O aviso ao lado de uma regra que libera mais do que o bloqueado (ver ruleKind), com a explicação no title. */
-function ruleWarning(kind: RuleKind, reason: RefusedReason | null): { text: string; title: string } | null {
+function ruleWarning(kind: RuleKind, reason: RefusedReason | null, rule: string): { text: string; title: string } | null {
   switch (kind) {
-    case 'refused':
-      return { text: 'Valeria para qualquer comando: não dá para liberar por aqui.', title: `${REFUSED_WHY[reason ?? 'empty']} ${REFUSED_HOW}` };
+    case 'refused': {
+      const why = reason ?? 'empty';
+      return { text: REFUSED_TEXT[why], title: `${REFUSED_WHY[why]} ${REFUSED_HOW[REFUSED_GROUP[why]]}` };
+    }
     case 'wildcard':
-      return {
-        text: 'O * é curinga: libera também outros comandos.',
-        title: 'Nas regras de permissão do Claude Code, o * vale por qualquer texto, inclusive espaços: esta regra libera todo comando nesse formato, e não só o que foi bloqueado. Depois de um programa que roda outros (sh -c *, env *, sudo *), vale para qualquer comando.',
-      };
+      return /^(?:Bash|PowerShell)\(/i.test(rule)
+        ? {
+            text: 'O * é curinga: libera também outros comandos.',
+            title: 'Nas regras de permissão do Claude Code, o * vale por qualquer texto, inclusive espaços: esta regra libera todo comando nesse formato, e não só o que foi bloqueado. Depois de um programa que roda outros (sh -c *, env *, sudo *), vale para qualquer comando.',
+          }
+        : {
+            text: 'O * é curinga: vale também para mais do que foi bloqueado.',
+            title: 'Nas regras de permissão do Claude Code, o * vale por qualquer texto: esta regra libera também outros endereços, arquivos ou chamadas nesse formato, e não só o que foi bloqueado.',
+          };
     case 'whole-tool':
       return {
         text: 'Libera a ferramenta inteira nesta execução, não só o que foi bloqueado.',
@@ -487,23 +521,22 @@ function ruleWarning(kind: RuleKind, reason: RefusedReason | null): { text: stri
   }
 }
 
-/** Os campos da ação que dizem o que foi bloqueado: o comando, o endereço, o arquivo ou a busca. */
-const BLOCKED_KEYS = ['command', 'url', 'file_path', 'notebook_path', 'path', 'query'];
-
 /**
  * O que foi bloqueado com cada regra, para mostrar embaixo dela: a regra de um WebFetch vale para o site
  * inteiro e a de um Write, para qualquer arquivo, mas só um endereço e um arquivo foram pedidos. Fica de
- * fora o que a própria regra já mostra (o comando de Bash(npm test)).
+ * fora o que a própria regra já mostra (o comando de Bash(npm test)) e os comandos que viraram mais de uma
+ * regra (`shown`), que já aparecem em cima das partes deles.
  */
-function blockedBy(rule: string, denials: PermissionDenial[]): string[] {
+function blockedBy(rule: string, denials: PermissionDenial[], shown: Set<string>): string[] {
   const tool = rule.split('(')[0];
   const texts = denials
     .filter((denial) => denial.rule === rule)
     .flatMap((denial) => {
-      const value = BLOCKED_KEYS.map((key) => denial.input[key]).find((v): v is string => typeof v === 'string' && v.trim() !== '');
+      const value = blockedValue(denial.input ?? {});
       if (!value || rule === `${denial.tool}(${value})`) return [];
       // O comando de um Monitor vira uma regra de Bash: o nome diz de onde ele veio.
-      return [denial.tool === tool ? value : `${denial.tool}: ${value}`];
+      const text = denial.tool === tool ? value : `${denial.tool}: ${value}`;
+      return shown.has(text) ? [] : [text];
     });
   return [...new Set(texts)];
 }
@@ -514,30 +547,129 @@ function oneLine(text: string, max = 200): string {
   return line.length > max ? `${line.slice(0, max)}…` : line;
 }
 
+/** Uma regra no painel, já classificada. */
+interface DenialRule {
+  rule: string;
+  kind: RuleKind;
+  reason: RefusedReason | null;
+}
+
+/** Uma linha do painel: a regra e o que foi bloqueado com ela (ver blockedBy). */
+interface DenialLine {
+  rule: DenialRule;
+  blocked: string[];
+}
+
+/** Uma regra sozinha, ou as regras das partes de um comando bloqueado, juntas embaixo dele (command). */
+interface DenialItem {
+  key: string;
+  command: string | null;
+  lines: DenialLine[];
+}
+
+/**
+ * As regras das ações bloqueadas como o painel as mostra. O agente costuma repetir o mesmo comando negado: cada
+ * regra aparece uma vez só. As de um comando com mais de uma regra (as partes de um comando encadeado, ou ele com e
+ * sem a variável de ambiente do começo; ver bashParts) ficam juntas embaixo dele, que aparece uma vez só: uma parte
+ * que também foi bloqueada antes, sozinha ou em outro comando, aparece de novo ali, com a mesma caixa.
+ */
+function denialItems(denials: PermissionDenial[]): { rules: DenialRule[]; items: DenialItem[]; actions: number } {
+  const rules = new Map<string, DenialRule>();
+  for (const { rule } of denials) if (!rules.has(rule)) rules.set(rule, { rule, kind: ruleKind(rule), reason: refusedReason(rule) });
+  const actions = blockedActions(denials);
+  // O comando de cada ação com mais de uma regra, escrito como embaixo de uma regra (o de um Monitor vem com o nome dele).
+  const commands = new Map(
+    actions.flatMap((action) =>
+      action.rules.length > 1 && action.value !== null
+        ? [[action, action.rules[0].split('(')[0] === action.tool ? action.value : `${action.tool}: ${action.value}`] as const]
+        : [],
+    ),
+  );
+  const captions = new Set(commands.values());
+  const shown = new Set<string>();
+  const items: DenialItem[] = [];
+  for (const action of actions) {
+    const command = commands.get(action);
+    if (command !== undefined) {
+      const lines = action.rules.map((rule) => ({ rule: rules.get(rule)!, blocked: blockedBy(rule, denials, captions) }));
+      items.push({ key: `comando:${action.tool}:${action.value}`, command, lines });
+      for (const rule of action.rules) shown.add(rule);
+      continue;
+    }
+    for (const rule of action.rules) {
+      if (shown.has(rule)) continue;
+      shown.add(rule);
+      items.push({ key: `regra:${rule}`, command: null, lines: [{ rule: rules.get(rule)!, blocked: blockedBy(rule, denials, captions) }] });
+    }
+  }
+  return { rules: [...rules.values()], items, actions: actions.length };
+}
+
+/** Embaixo de um comando que virou mais de uma regra. */
+const PARTS_HELP = 'O Claude Code confere cada parte deste comando separadamente: libere todas para ele rodar.';
+const PARTS_TITLE =
+  'O Claude Code divide o comando nos separadores (&&, ||, ;, |, & e quebras de linha) e confere cada parte com as regras, sem os wrappers como timeout, nice, nohup e xargs. Uma variável de ambiente no começo (como NODE_ENV=test) às vezes sai também, então a mesma parte vem com e sem ela.';
+
 /** Ainda há o que liberar por aqui, mas nada marcado. */
 const NOTHING_CHOSEN = 'Marque o que quer liberar: o que vale para mais do que foi bloqueado vem desmarcado. Se o agente já resolveu de outro jeito, conclua.';
-const REFUSED_HINT = ' O que está riscado não dá para liberar por aqui: continue no terminal ou peça ao agente o comando exato.';
+
+/** Nada dá para liberar por aqui: o porquê, com uma ação ou com várias. */
+const NOTHING_ALLOWED: Record<RefusedGroup, [string, string]> = {
+  any: ['Esta ação não dá para liberar por aqui: valeria para qualquer comando.', 'Nenhuma destas ações dá para liberar por aqui: valeriam para qualquer comando.'],
+  domain: ['Esta ação não dá para liberar por aqui: valeria para qualquer site.', 'Nenhuma destas ações dá para liberar por aqui: valeriam para qualquer site.'],
+  compound: [
+    'Esta ação não dá para liberar por aqui: o comando tem partes que o Octo não consegue liberar uma a uma.',
+    'Nenhuma destas ações dá para liberar por aqui: os comandos têm partes que o Octo não consegue liberar uma a uma.',
+  ],
+  mixed: ['Esta ação não dá para liberar por aqui: o motivo está ao lado de cada regra.', 'Nenhuma destas ações dá para liberar por aqui: o motivo está ao lado de cada regra.'],
+};
+
+/** No fim do texto de ajuda, quando também há o que liberar. */
+const REFUSED_HINT: Record<RefusedGroup, string> = {
+  any: ' O que está riscado não dá para liberar por aqui: continue no terminal ou peça ao agente o comando exato.',
+  domain: ' O que está riscado não dá para liberar por aqui: continue no terminal ou peça ao agente o endereço exato.',
+  compound: ' O que está riscado não dá para liberar por aqui: continue no terminal ou peça ao agente para rodar as partes separadamente.',
+  mixed: ' O que está riscado não dá para liberar por aqui: continue no terminal ou responda ao agente.',
+};
+
+/** Uma regra no painel: a caixa, a regra com o aviso e, embaixo, o que foi bloqueado com ela. */
+function DenialRow({ line, checked, disabled, onToggle }: { line: DenialLine; checked: boolean; disabled: boolean; onToggle: () => void }) {
+  const { rule, kind, reason } = line.rule;
+  const warning = ruleWarning(kind, reason, rule);
+  return (
+    <label className={`denial is-${kind}`}>
+      <input type="checkbox" checked={checked} onChange={onToggle} disabled={disabled} />
+      <span className="denial-body">
+        <span className="denial-rule">
+          <code>{rule}</code>
+          {warning && (
+            <span className="denial-warning" title={warning.title}>
+              <AlertTriangle size={12} /> {warning.text}
+            </span>
+          )}
+        </span>
+        {line.blocked.slice(0, 3).map((text) => (
+          <small key={text} className="denial-blocked" title={text.slice(0, 2000)}>{oneLine(text)}</small>
+        ))}
+        {line.blocked.length > 3 && <small className="denial-blocked">e mais {line.blocked.length - 3}</small>}
+      </span>
+    </label>
+  );
+}
 
 /** Equivalente à "elicitation" do Linear: o agente parou porque precisa de permissão. */
 function Denials({ session, canContinue }: { session: Session; canContinue: boolean }) {
-  // O agente costuma repetir o mesmo comando negado: cada regra aparece uma vez só.
-  const rows = useMemo(
-    () =>
-      [...new Set(session.pendingDenials.map((d) => d.rule))].map((rule) => ({
-        rule,
-        kind: ruleKind(rule),
-        reason: refusedReason(rule),
-        blocked: blockedBy(rule, session.pendingDenials),
-      })),
-    [session.pendingDenials],
-  );
+  const { rules, items, actions } = useMemo(() => denialItems(session.pendingDenials), [session.pendingDenials]);
+  const ids = useId();
   // Só vem marcado o que libera apenas o que foi bloqueado: o resto vale para mais, e só vai se você marcar.
-  const [chosen, setChosen] = useState(() => new Set(rows.filter((row) => row.kind === 'scoped').map((row) => row.rule)));
+  const [chosen, setChosen] = useState(() => new Set(rules.filter((row) => row.kind === 'scoped').map((row) => row.rule)));
   const [busy, setBusy] = useState(false);
-  // O que vale para qualquer comando nunca vai (o servidor recusaria): nem tem caixa para marcar.
-  const selected = rows.filter((row) => row.kind !== 'refused' && chosen.has(row.rule)).map((row) => row.rule);
-  const selectable = rows.some((row) => row.kind !== 'refused');
-  const hint = rows.some((row) => row.kind === 'refused') ? REFUSED_HINT : '';
+  // O que o Octo não libera nunca vai (o servidor recusaria): nem tem caixa para marcar.
+  const selected = rules.filter((row) => row.kind !== 'refused' && chosen.has(row.rule)).map((row) => row.rule);
+  const selectable = rules.some((row) => row.kind !== 'refused');
+  const groups = new Set(rules.flatMap((row) => (row.kind === 'refused' ? [REFUSED_GROUP[row.reason ?? 'empty']] : [])));
+  const refused: RefusedGroup | null = !groups.size ? null : groups.size === 1 ? [...groups][0] : 'mixed';
+  const hint = refused ? REFUSED_HINT[refused] : '';
   const toggle = (rule: string) =>
     setChosen((c) => {
       const next = new Set(c);
@@ -556,41 +688,40 @@ function Denials({ session, canContinue }: { session: Session; canContinue: bool
       setBusy(false);
     }
   };
+  const row = (line: DenialLine, key: string) => (
+    <DenialRow
+      key={key}
+      line={line}
+      checked={line.rule.kind !== 'refused' && chosen.has(line.rule.rule)}
+      disabled={busy || line.rule.kind === 'refused'}
+      onToggle={() => toggle(line.rule.rule)}
+    />
+  );
   return (
     <div className="denials">
       <div className="denials-head">
         <ShieldQuestion size={15} />
-        {rows.length === 1 ? 'Uma ação foi bloqueada' : `${rows.length} ações foram bloqueadas`} pelo modo de permissão
+        {actions === 1 ? 'Uma ação foi bloqueada' : `${actions} ações foram bloqueadas`} pelo modo de permissão
       </div>
       <p className="denials-help">
         {!selectable
-          ? `${rows.length === 1 ? 'Esta ação não dá para liberar por aqui: valeria' : 'Nenhuma destas ações dá para liberar por aqui: valeriam'} para qualquer comando. ${REFUSED_HOW} Se ele já resolveu de outro jeito, conclua.`
+          ? `${NOTHING_ALLOWED[refused ?? 'any'][actions === 1 ? 0 : 1]} ${REFUSED_HOW[refused ?? 'any']} Se ele já resolveu de outro jeito, conclua.`
           : selected.length
             ? `Se o agente precisava disso para terminar, permita e ele continua de onde parou. Se ele já resolveu de outro jeito, conclua.${hint}`
             : `${NOTHING_CHOSEN}${hint}`}
       </p>
-      {rows.map(({ rule, kind, reason, blocked }) => {
-        const warning = ruleWarning(kind, reason);
-        return (
-          <label key={rule} className={`denial is-${kind}`}>
-            <input type="checkbox" checked={kind !== 'refused' && chosen.has(rule)} onChange={() => toggle(rule)} disabled={busy || kind === 'refused'} />
-            <span className="denial-body">
-              <span className="denial-rule">
-                <code>{rule}</code>
-                {warning && (
-                  <span className="denial-warning" title={warning.title}>
-                    <AlertTriangle size={12} /> {warning.text}
-                  </span>
-                )}
-              </span>
-              {blocked.slice(0, 3).map((text) => (
-                <small key={text} className="denial-blocked" title={text.slice(0, 2000)}>{oneLine(text)}</small>
-              ))}
-              {blocked.length > 3 && <small className="denial-blocked">e mais {blocked.length - 3}</small>}
-            </span>
-          </label>
-        );
-      })}
+      {items.map((item, index) =>
+        item.command === null ? (
+          row(item.lines[0], item.key)
+        ) : (
+          // As partes de um comando ficam juntas, embaixo dele: o grupo leva o comando como nome e a explicação como descrição.
+          <div key={item.key} className="denial-group" role="group" aria-labelledby={`${ids}-${index}`} aria-describedby={`${ids}-${index}-ajuda`}>
+            <code id={`${ids}-${index}`} className="denial-group-command" title={item.command.slice(0, 2000)}>{oneLine(item.command)}</code>
+            <small id={`${ids}-${index}-ajuda`} className="denial-group-help" title={PARTS_TITLE}>{PARTS_HELP}</small>
+            {item.lines.map((line) => row(line, line.rule.rule))}
+          </div>
+        ),
+      )}
       <div className="denials-actions">
         <button
           className="primary-btn"

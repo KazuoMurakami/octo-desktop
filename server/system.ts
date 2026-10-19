@@ -1,6 +1,7 @@
 // Integração de baixo nível com o sistema: achar programas no PATH, montar o ambiente dos
 // processos filhos, abrir programas destacados (terminal, editor, explorador) e copiar pastas.
-// Sem dependências do resto do servidor: é usado por claude.ts, terminal.ts, integrations.ts e index.ts.
+// Sem dependências do resto do servidor: é usado por claude.ts, terminal.ts, integrations.ts, index.ts,
+// agent.ts e store.ts (cutPoint, shrinkToFit) e gitSafe.ts.
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { accessSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync, type Stats } from 'node:fs';
 import path from 'node:path';
