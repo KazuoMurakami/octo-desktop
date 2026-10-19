@@ -2,8 +2,8 @@
 // workspace, com um worktree git de cada repositório em foco, todos numa branch curta só dela
 // (ex.: red-7-api-typescript). As sessões rodam lá dentro sem mexer na pasta original dos repositórios.
 import { spawn } from 'node:child_process';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
-import { chmod, lstat, readdir, rmdir, unlink } from 'node:fs/promises';
+import { constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { chmod, copyFile, lstat, mkdir, readdir, realpath, rmdir, stat, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { AgentSession, Issue, Repo, Workspace, Worktree, WorktreeBase, WorktreeRepo, WorktreeStatus } from '../shared/types.ts';
@@ -379,6 +379,11 @@ async function quietSsh(repo: Repo): Promise<NodeJS.ProcessEnv> {
  */
 async function defaultBase(repo: Repo): Promise<BaseRef> {
   const hasOrigin = await succeeds(repo.absPath, ['remote', 'get-url', 'origin']);
+  // O ls-remote e o fetch usam a config do repositório como ela é (a chave de SSH e o gerenciador de
+  // credenciais dele, inclusive), sem a leitura segura do gitSafe: criar o worktree é uma ação pedida pela
+  // pessoa, e o `git worktree add` logo depois roda de qualquer jeito os hooks (post-checkout) e os
+  // filtros (smudge) do repositório. Neutralizar a config só aqui quebraria setups legítimos sem proteger
+  // nada. As leituras automáticas (varredura, aba Mudanças, início e fim de sessão) seguem protegidas.
   const env = hasOrigin ? await quietSsh(repo) : {};
   let reached = false;
   let unsafe = '';
@@ -437,34 +442,75 @@ async function defaultBase(repo: Repo): Promise<BaseRef> {
 
 // ---------------------------------------------------------------- cópias para dentro do worktree
 
+interface Included {
+  copied: string[];
+  /** Arquivos que sozinhos passavam do que restava do teto de bytes: ficaram de fora, e os seguintes não. */
+  tooBig: { file: string; size: number }[];
+}
+
 /**
  * Arquivos fora do git que o repositório pede para levar a worktrees novos, como o Claude Code faz:
  * o `.worktreeinclude` da raiz lista padrões no formato do .gitignore, e só vai o que casa com eles
- * e também é ignorado pelo git (ex.: .env). Devolve os caminhos copiados.
+ * e também é ignorado pelo git (ex.: .env). Devolve os caminhos copiados e os grandes demais.
  */
-async function copyIncluded(repo: Repo, target: string): Promise<string[]> {
-  if (!existsSync(path.join(repo.absPath, '.worktreeinclude'))) return [];
+async function copyIncluded(repo: Repo, target: string, budget: CopyBudget): Promise<Included> {
+  const result: Included = { copied: [], tooBig: [] };
+  if (!existsSync(path.join(repo.absPath, '.worktreeinclude'))) return result;
   const listed = (await git(repo.absPath, ['ls-files', '--others', '--ignored', '--exclude-from=.worktreeinclude', '-z'])).split('\0').filter(Boolean);
-  if (!listed.length) return [];
+  if (!listed.length) return result;
   // check-ignore sai com código 1 quando nenhum é ignorado.
   const ignored = (await git(repo.absPath, ['check-ignore', '--stdin', '-z'], { input: `${listed.join('\0')}\0` }).catch(() => ''))
     .split('\0')
     .filter(Boolean);
-  const copied: string[] = [];
+  // O caminho real do repositório (com os links resolvidos), para conferir que nenhum arquivo copiado
+  // escapou dele por um link. O realpath de fs/promises é o nativo: resolve junctions do Windows.
+  const repoReal = await realpath(repo.absPath).catch(() => path.resolve(repo.absPath));
+  // E/S assíncrona e com o mesmo teto do copyContext: um node_modules no .worktreeinclude não trava o
+  // servidor nem enche o disco (ver FS-2). O teto de arquivos para o laço (os grandes demais contam,
+  // para uma lista enorme não ser percorrida inteira) e vira um aviso.
   for (const file of ignored) {
+    if (budget.cut) break;
     const from = path.join(repo.absPath, file);
     const to = path.join(target, file);
-    if (!isInside(repo.absPath, from) || !isInside(target, to) || existsSync(to)) continue;
+    if (!isInside(repo.absPath, from) || !isInside(target, to)) continue;
     try {
-      if (!statSync(from).isFile()) continue;
-      mkdirSync(path.dirname(to), { recursive: true });
-      copyFileSync(from, to);
-      copied.push(file);
+      // Um link (no fim do caminho ou um junction/symlink de pasta no meio dele, por onde o git também
+      // lista arquivos) só é seguido se o caminho real continuar dentro do repositório: um link para um
+      // arquivo do próprio repositório (ex.: apps/web/.env → ../../.env) vira uma cópia do conteúdo dele,
+      // e um para fora fica de fora.
+      const link = await lstat(from);
+      const real = await realpath(from);
+      if (!isInside(repoReal, real)) continue;
+      // lstat não segue o link do fim do caminho: num link, o tipo e o tamanho que valem são os do arquivo apontado.
+      const info = link.isSymbolicLink() ? await stat(real) : link;
+      if (!info.isFile()) continue;
+      if (budget.files + result.tooBig.length >= COPY_LIMIT.files) {
+        budget.cut = true;
+        break;
+      }
+      // Um arquivo grande demais para o que resta do teto fica de fora sozinho: os pequenos depois dele ainda vão.
+      if (budget.bytes + info.size > COPY_LIMIT.bytes) {
+        result.tooBig.push({ file, size: info.size });
+        continue;
+      }
+      await mkdir(path.dirname(to), { recursive: true });
+      // COPYFILE_EXCL: não sobrescreve um arquivo que já exista no destino (e dispensa um existsSync no laço).
+      await copyFile(real, to, fsConstants.COPYFILE_EXCL);
+      budget.files++;
+      budget.bytes += info.size;
+      result.copied.push(file);
     } catch {
-      /* sumiu ou não deu para ler: segue sem ele */
+      /* sumiu, link quebrado, já existe (EEXIST) ou não deu para ler: segue sem ele */
     }
   }
-  return copied;
+  return result;
+}
+
+/** Tamanho para os avisos: 512 KB, 60 MB, 1,5 GB. */
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 interface CopyBudget {
@@ -653,6 +699,8 @@ export async function prepareWorktree(workspace: Workspace, issue: Issue, base: 
       if (target !== reserved) await clearFolder(target);
       await forgetWorktree(repo.absPath, target);
       mkdirSync(path.dirname(target), { recursive: true });
+      // O `git worktree add` fica como está (sem o prefixo de leitura segura): a pessoa pediu este
+      // checkout, e os filtros (git-lfs) e o hook post-checkout do repositório devem rodar normalmente.
       try {
         // A pasta deste repositório sumiu, mas a branch dele continua: volta para ela, com o trabalho que já tinha.
         if (previous && safeRef(previous.branch) && (await succeeds(repo.absPath, ['show-ref', '--verify', '--quiet', `refs/heads/${previous.branch}`]))) {
@@ -682,8 +730,14 @@ export async function prepareWorktree(workspace: Workspace, issue: Issue, base: 
         if (error instanceof HttpError) throw error;
         throw new HttpError(400, `Não foi possível criar o worktree de ${repo.name}: ${gitMessage(error)}`);
       }
-      const copied = await copyIncluded(repo, target).catch(() => []);
+      const includeBudget: CopyBudget = { files: 0, bytes: 0, cut: false, accounts: [] };
+      const { copied, tooBig } = await copyIncluded(repo, target, includeBudget).catch((): Included => ({ copied: [], tooBig: [] }));
       if (copied.length) notes.push(`${repo.name}: copiados do .worktreeinclude ${copied.slice(0, 6).join(', ')}${copied.length > 6 ? ` e mais ${copied.length - 6}` : ''}.`);
+      if (tooBig.length) {
+        const named = tooBig.slice(0, 3).map((item) => `${item.file} (${formatSize(item.size)})`).join(', ');
+        notes.push(`${repo.name}: ficaram fora do worktree, por passarem do teto de ${COPY_LIMIT.bytes / 1024 / 1024} MB das cópias do .worktreeinclude: ${named}${tooBig.length > 3 ? ` e mais ${tooBig.length - 3}` : ''}.`);
+      }
+      if (includeBudget.cut) notes.push(`${repo.name}: o .worktreeinclude passou de ${COPY_LIMIT.files} arquivos, e o resto ficou de fora.`);
     }
     const cut = copyContext(workspace, focus, root);
     if (cut) notes.push(cut);

@@ -240,7 +240,7 @@ export type SessionMode = 'headless' | 'terminal';
 export interface PermissionDenial {
   tool: string;
   input: Record<string, unknown>;
-  /** Regra sugerida para --allowedTools, ex.: Bash(npm test) */
+  /** Regra sugerida para liberar a ação (vai no permissions.allow do --settings), ex.: Bash(npm test) */
   rule: string;
 }
 

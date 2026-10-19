@@ -1,0 +1,63 @@
+# Empacota o app no Windows (o sistema principal) e roda o autoteste quando muda o que vai dentro do
+# instalador: Electron, electron-builder, o processo principal e os scripts de build. Assim um PR do
+# Dependabot que sobe o Electron é testado antes do merge, e não só na tag. O workflow Release faz o
+# mesmo nos três sistemas (dá para rodá-lo pelo botão Run workflow, sem publicar nada).
+name: Empacotamento
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'electron/**'
+      - 'electron-builder.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/**'
+      - 'build/**'
+      - '.github/workflows/package.yml'
+  pull_request:
+    paths:
+      - 'electron/**'
+      - 'electron-builder.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/**'
+      - 'build/**'
+      - '.github/workflows/package.yml'
+  workflow_dispatch:
+
+# Sem cache dos downloads do Electron, como no Release: o electron-builder reaproveita a pasta já
+# extraída sem conferir de novo o conteúdo.
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      # O electron-builder baixa o Electron que empacota; o do npm não é usado aqui.
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      - run: npm run dist
+        env:
+          # Sem certificado: o instalador sai sem assinatura, como no Release.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Fuses do Electron
+        run: node scripts/check-fuses.mjs release/win-unpacked/Octo.exe
+      - name: Autoteste do app empacotado
+        timeout-minutes: 5
+        env:
+          OCTO_DATA_DIR: ${{ runner.temp }}/octo-selftest
+        run: ./release/win-unpacked/Octo.exe --self-test

@@ -11,6 +11,7 @@ import {
   type AccountStatus, type AppState, type ClaudeAccount, type Effort, type Issue, type IssueStatus, type PermissionMode, type Priority,
   type Repo, type SessionSettings, type Workspace, type WorktreeBase,
 } from '../shared/types.ts';
+import { refusedReason, type RefusedReason } from '../shared/permissions.ts';
 import {
   dismissDenials, finishSession, isInside, isRunning, isWorking, refuseTerminalImages, resumeInTerminal, sendMessage, sessionActivities, settleRun,
   startHeadless,
@@ -171,8 +172,9 @@ function existingDirs(value: unknown): string[] {
 }
 
 /**
- * Regras de --allowedTools (ex.: "Bash(npm test)", "Edit", "mcp__servidor__ferramenta"). Nunca
- * começam com "-": um valor assim encerraria a lista e viraria uma opção do claude.
+ * Regras das ações liberadas numa resposta (ex.: "Bash(npm test)", "Edit", "mcp__servidor__ferramenta").
+ * Cada uma vai inteira num item do permissions.allow do --settings (ver planRun, em agent.ts): só
+ * passa `Ferramenta` ou `Ferramenta(conteúdo)`, com o nome sem curinga ("*", "Bash*") e nada depois do ")".
  */
 function allowedRules(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -180,9 +182,24 @@ function allowedRules(value: unknown): string[] {
   if (rules.length > 50) throw new HttpError(400, 'Libere no máximo 50 ações de uma vez.');
   for (const rule of rules) {
     if (!/^[A-Za-z][\w.:-]*(\([\s\S]*\))?$/.test(rule)) throw new HttpError(400, `Regra de permissão inválida: ${rule.slice(0, 80)}`);
+    // O Octo não libera (ver refusedReason): o painel já mostra essas riscadas, sem caixa para marcar.
+    const refused = refusedReason(rule);
+    if (refused) throw new HttpError(400, REFUSED[refused](rule.slice(0, 80)));
   }
   return rules;
 }
+
+/** A recusa de uma regra que o Octo não libera: o motivo e o que fazer. */
+const REFUSED: Record<RefusedReason, (rule: string) => string> = {
+  empty: (rule) => `Regra de permissão ampla demais: ${rule} liberaria qualquer comando (sem comando definido). Desmarque essa ação, ou responda sem liberar.`,
+  program: (rule) => `Regra de permissão ampla demais: ${rule} liberaria qualquer comando (o * está no lugar do programa). Desmarque essa ação, ou responda sem liberar.`,
+  monitor: (rule) =>
+    `Regra de permissão ampla demais: ${rule} liberaria qualquer comando (o Monitor roda comandos pelo shell). Libere o comando exato, numa regra Bash(...), ou responda sem liberar.`,
+  domain: (rule) =>
+    `Regra de permissão ampla demais: ${rule} liberaria qualquer site (e abriria a rede dos comandos no sandbox para qualquer endereço). Desmarque essa ação, ou responda sem liberar.`,
+  compound: (rule) =>
+    `Regra de permissão que não dá para liberar por aqui: ${rule} tem partes que o Octo não consegue liberar uma a uma (o Claude Code confere cada parte do comando separadamente, e uma regra com ele inteiro não valeria). Para seguir, continue no terminal, onde o Claude Code pergunta parte por parte, ou peça ao agente para rodar as partes separadamente.`,
+};
 
 function budget(value: unknown): number | null {
   const amount = Number(value);

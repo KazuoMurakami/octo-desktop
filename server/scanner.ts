@@ -5,6 +5,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Repo, Workspace } from '../shared/types.ts';
+import { readOnlyGit, type SafeGit } from './gitSafe.ts';
 import { baseEnv, gitPath, samePath } from './system.ts';
 
 const SKIP_DIRS = new Set([
@@ -79,15 +80,16 @@ export async function findRepoDirs(root: string, maxDepth: number, limits: FindL
   return { dirs: found.sort((a, b) => a.localeCompare(b)), partial };
 }
 
-function git(cwd: string, args: string[], timeout = 8000): Promise<string | null> {
+// `safe`: o prefixo e o ambiente do gitSafe, para a config do repositório não rodar nenhum programa nesta leitura.
+function git(cwd: string, args: string[], timeout: number, safe: SafeGit): Promise<string | null> {
   return new Promise((resolve) => {
     try {
       execFile(
         // Por caminho absoluto: com o nome solto, o Windows rodaria um git.exe de dentro do repositório.
         gitPath(),
-        args,
+        [...safe.args, ...args],
         // Sem o lock opcional do índice: o git status do Octo não disputa o .git/index.lock com o agente.
-        { cwd, timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024, env: { ...baseEnv(), GIT_OPTIONAL_LOCKS: '0' } },
+        { cwd, timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024, env: { ...baseEnv(), GIT_OPTIONAL_LOCKS: '0', ...safe.env } },
         (error, stdout) => resolve(error ? null : stdout.toString()),
       );
     } catch {
@@ -207,14 +209,22 @@ async function describeRepo(workspace: Workspace, dir: string): Promise<Repo> {
   const names = new Set(entries);
   const gitDir = await resolveGitDir(dir).catch(() => path.join(dir, '.git'));
 
-  const [branch, remoteUrl, project, log, status, aheadBehind] = await Promise.all([
+  const [branch, remoteUrl, project, safe] = await Promise.all([
     readBranch(gitDir),
     readRemote(gitDir),
     detectProject(dir, names),
-    git(dir, ['log', '-1', '--format=%cI%x1f%s']),
-    git(dir, ['status', '--porcelain=v1']),
-    git(dir, ['rev-list', '--left-right', '--count', '@{upstream}...HEAD'], 4000),
+    // Calculado uma vez por repositório: a config dele não roda nada nas leituras abaixo (ver gitSafe.ts).
+    // Sem conseguir garantir isso (ou sem git), elas nem rodam: alterações e último commit ficam sem valor.
+    readOnlyGit(dir).catch(() => null),
   ]);
+  const [log, status, aheadBehind] = safe
+    ? await Promise.all([
+        git(dir, ['log', '-1', '--format=%cI%x1f%s'], 8000, safe),
+        // O status entra nos submódulos com as mesmas neutralizações (ou não entra: safe.submodules).
+        git(dir, ['status', '--porcelain=v1', ...safe.submodules], 8000, safe),
+        git(dir, ['rev-list', '--left-right', '--count', '@{upstream}...HEAD'], 4000, safe),
+      ])
+    : [null, null, null];
 
   const [lastCommitAt, lastCommitMessage] = log?.trim() ? log.trim().split('\x1f') : [null, null];
   const counts = aheadBehind?.trim().split(/\s+/).map(Number);

@@ -29,11 +29,11 @@ No app instalado, `OCTO_DEVTOOLS=1` mostra as ferramentas de desenvolvedor no me
 
 ## Antes de abrir um PR
 
-- `npm run typecheck` e `npm run build:desktop` passam.
+- `npm run typecheck` e `npm run build:desktop` passam. O CI repete isso no Windows, no macOS e no Linux, com o Node mínimo (22.18) e o atual, e confere que o servidor sobe e protege a API.
 - A interface e as mensagens estão em português do Brasil, num tom direto.
 - Mudanças em `server/terminal.ts`, `server/integrations.ts` ou no Electron foram testadas no sistema em que você roda (diga qual no PR).
 - Nada de dependências novas sem necessidade; o app empacotado só leva o `express` em produção.
-- Mudanças no `electron-builder.yml`, em `electron/` ou nos workflows: rode o workflow **Release** pelo botão *Run workflow* (no seu fork), que gera e testa os instaladores dos três sistemas sem publicar nada.
+- Mudanças no `electron-builder.yml`, em `electron/`, nos scripts de build ou nas dependências disparam o workflow **Empacotamento**, que gera o app do Windows e roda o autoteste. Para os três sistemas, rode o workflow **Release** pelo botão *Run workflow* (no seu fork), que gera e testa os instaladores sem publicar nada.
 - Não desligue o fuse `runAsNode`: o terminal do Octo depende dele (veja o [SECURITY.md](SECURITY.md)).
 
 ## Estrutura

@@ -8,14 +8,15 @@ import {
   type Activity, type AgentSession, type ClaudeAccount, type Issue, type PermissionDenial, type PermissionMode, type Repo, type SessionSettings,
   type Workspace, type Worktree,
 } from '../shared/types.ts';
+import { bashParts, blockedActions } from '../shared/permissions.ts';
 import { dirtyEntries } from './changes.ts';
 import { claudeEnv, requireClaude, type ClaudeCommand } from './claude.ts';
 import { broadcast } from './events.ts';
 import { imageBlocks, saveImages, saveTranscriptImages, type ParsedImage } from './images.ts';
 import { HttpError, addHistory, commitIssue, commitSession, now, requireFolder, workspaceRepos } from './model.ts';
 import { describeRepos } from './scanner.ts';
-import { appendActivity, db, readActivities, save, writeActivities, writeBaseline } from './store.ts';
-import { describeSpawnError, fitsCommandLine, shrinkToFit } from './system.ts';
+import { appendActivity, db, denialInput, readActivities, save, writeActivities, writeBaseline } from './store.ts';
+import { cutPoint, describeSpawnError, fitsCommandLine, shrinkToFit } from './system.ts';
 import { openClaudeTerminal } from './terminal.ts';
 import { sessionRepos, worktreeCwd } from './worktrees.ts';
 
@@ -101,6 +102,22 @@ function relFrom(cwd: string, target: string): string {
 
 /** Contexto anexado ao system prompt: é o que dá ao Claude a visão de todos os repos de uma vez. */
 export function workspaceSystemPrompt(workspace: Workspace, cwd: string, worktree: Worktree | null = null): string {
+  return workspaceContext(workspace, cwd, worktree).text;
+}
+
+/** O contexto do workspace e o começo dele que um corte nunca tira. */
+interface WorkspaceContext {
+  text: string;
+  /** Tamanho do começo com as regras do Octo (e as do worktree): o corte só tira o que vem depois, repositórios e diretrizes. */
+  rules: number;
+}
+
+/**
+ * O contexto do workspace (ver workspaceSystemPrompt). As regras do Octo vêm antes dos repositórios e das
+ * diretrizes: se ele não couber na linha de comando, o corte começa pelo fim e nunca chega nelas (ver
+ * planRun e fitTerminalArgs).
+ */
+function workspaceContext(workspace: Workspace, cwd: string, worktree: Worktree | null = null): WorkspaceContext {
   // Num worktree, os repositórios dele aparecem nos caminhos (e na branch) do worktree; os outros, na pasta original.
   const repos = sessionRepos({ workspaceId: workspace.id, worktree });
   const inside = repos.filter((r) => isInside(cwd, r.absPath));
@@ -117,11 +134,8 @@ export function workspaceSystemPrompt(workspace: Workspace, cwd: string, worktre
     : atRoot
       ? `O diretório atual é a RAIZ do workspace "${workspace.name}", uma pasta com ${repos.length} repositórios git independentes (não é um monorepo):`
       : `O diretório atual (${relFrom(workspace.rootPath, cwd)} dentro do workspace "${workspace.name}", raiz ${workspace.rootPath}) contém ${inside.length} repositório(s) git independente(s):`;
-  return [
+  const rules = [
     'Você foi iniciado pelo Octo, um gerenciador local de issues.',
-    where,
-    ...inside.map(describe),
-    ...(outside.length ? ['', `Outros repositórios do workspace, fora da pasta atual: ${outside.map((r) => r.name).join(', ')}.`] : []),
     '',
     'Regras do workspace:',
     '- Cada repositório tem seu próprio git: rode comandos git dentro dele (ex.: git -C <repo> status). Nunca rode git init numa pasta que agrupa repositórios.',
@@ -130,10 +144,17 @@ export function workspaceSystemPrompt(workspace: Workspace, cwd: string, worktre
     '- Não faça commit, push ou operações destrutivas a menos que a issue peça explicitamente.',
     '- Ao terminar, responda com um resumo curto: o que mudou em cada repositório e os próximos passos.',
     '- Responda em português do Brasil.',
-    // Antes das diretrizes: se o contexto não couber na linha de comando do terminal, o corte começa pelo fim.
     ...(worktree ? ['', ...worktreeRules(workspace, worktree)] : []),
+  ].join('\n');
+  const text = [
+    rules,
+    '',
+    where,
+    ...inside.map(describe),
+    ...(outside.length ? ['', `Outros repositórios do workspace, fora da pasta atual: ${outside.map((r) => r.name).join(', ')}.`] : []),
     workspace.guidance.trim() ? `\nDiretrizes do workspace definidas pelo usuário:\n${workspace.guidance.trim()}` : '',
   ].join('\n');
+  return { text, rules: rules.length };
 }
 
 /** Regras de uma sessão num worktree: onde trabalhar e o que não veio da pasta original. */
@@ -268,9 +289,43 @@ function summarizeTool(session: AgentSession, name: string, input: Record<string
   }
 }
 
-function denialRule(tool: string, input: Record<string, any>): string {
-  if ((tool === 'Bash' || tool === 'PowerShell') && typeof input.command === 'string') return `${tool}(${input.command})`;
-  return tool;
+/**
+ * Regras que liberam a ação bloqueada (vão no permissions.allow do --settings), as mais restritas que o Claude
+ * Code entende. Um comando do Bash vira uma regra por parte, sem os wrappers, como o Claude Code o confere (ver
+ * bashParts, em shared/permissions.ts); o que a divisão não modela fica numa regra só, com o comando inteiro, que
+ * o painel mostra recusada. Sem como restringir, fica só o nome da ferramenta, que vale para todo uso dela: o
+ * painel avisa (ver ruleKind), e o Bash e o PowerShell sozinhos o servidor nem aceita.
+ */
+function denialRules(tool: string, input: Record<string, any>): string[] {
+  const command = typeof input.command === 'string' ? input.command : null;
+  // O Monitor roda o comando pelo shell, com as regras do Bash: liberar o "Monitor" valeria para qualquer comando.
+  if ((tool === 'Bash' || tool === 'Monitor') && command !== null) return (bashParts(command) ?? [command]).map((part) => `Bash(${part})`);
+  // O comando do PowerShell fica inteiro: com mais de uma parte, o painel o mostra recusado (ver refusedReason).
+  if (tool === 'PowerShell' && command !== null) return [`PowerShell(${command})`];
+  if (tool === 'WebFetch') {
+    const host = fetchHost(input.url);
+    if (host) return [`WebFetch(domain:${host})`];
+  }
+  return [tool];
+}
+
+/**
+ * O host de um endereço http(s), para a regra WebFetch(domain:host), que vale só para ele (nem os
+ * subdomínios entram). Null quando não dá para restringir assim: um IPv6, um nome com "*" (que na regra
+ * viraria curinga) ou com outros caracteres fora do comum.
+ */
+function fetchHost(url: unknown): string | null {
+  if (typeof url !== 'string') return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  // Como no Claude Code, maiúsculas e o ponto do fim não contam ("Exemplo.com." vale "exemplo.com").
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  return /^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/.test(host) ? host : null;
 }
 
 function resultText(content: unknown): string {
@@ -367,11 +422,14 @@ function handleEvent(session: AgentSession, run: Run | null, event: any): void {
     session.costUsd += Number(event.total_cost_usd ?? 0);
     session.durationMs += Number(event.duration_ms ?? 0);
     session.turns += Number(event.num_turns ?? 0);
-    const denials: PermissionDenial[] = (event.permission_denials ?? []).map((d: any) => ({
-      tool: d.tool_name,
-      input: d.tool_input ?? {},
-      rule: denialRule(d.tool_name, d.tool_input ?? {}),
-    }));
+    // Uma entrada por regra: as partes de um comando encadeado vêm com a mesma ação (ver denialRules e
+    // blockedActions). As regras saem do tool_input inteiro; na sessão fica só o que se lê dele (ver denialInput).
+    const denials: PermissionDenial[] = (Array.isArray(event.permission_denials) ? event.permission_denials : []).flatMap((d: any) => {
+      if (typeof d?.tool_name !== 'string' || !d.tool_name) return [];
+      const toolInput = d.tool_input && typeof d.tool_input === 'object' && !Array.isArray(d.tool_input) ? d.tool_input : {};
+      const input = denialInput(toolInput);
+      return denialRules(d.tool_name, toolInput).map((rule) => ({ tool: d.tool_name, input, rule }));
+    });
     session.pendingDenials = denials;
 
     const failed = event.is_error || (event.subtype && event.subtype !== 'success');
@@ -417,7 +475,9 @@ function onSessionSettled(session: AgentSession): void {
     issue.reviewPending = othersRunning && issue.status === 'in_progress';
   } else {
     if (session.state === 'awaiting_input') {
-      addHistory(issue, 'session', actor, session.pendingDenials.length === 1 ? 'aguarda permissão para 1 ação' : `aguarda permissão para ${session.pendingDenials.length} ações`);
+      // As regras das partes de um comando contam como uma ação só.
+      const count = blockedActions(session.pendingDenials).length;
+      addHistory(issue, 'session', actor, count === 1 ? 'aguarda permissão para 1 ação' : `aguarda permissão para ${count} ações`);
     } else if (session.state === 'error') {
       addHistory(issue, 'session', actor, 'encerrou a sessão com erro');
     }
@@ -536,7 +596,7 @@ export function startHeadless(options: StartOptions): AgentSession {
     prompt,
     ['--session-id', session.claudeSessionId, '--name', session.title.slice(0, 80)],
     [],
-    workspaceSystemPrompt(options.workspace, session.cwd, session.worktree),
+    workspaceContext(options.workspace, session.cwd, session.worktree),
     options.images,
   );
   plan.images = options.savedImages ?? saveImages(session.id, options.images ?? []);
@@ -569,7 +629,12 @@ export async function sendMessage(
   // mesma conversa, e dois processos gravando o mesmo histórico o embaralham. Em segundo plano, a
   // conversa segue num ramo novo (--fork-session), com todo o histórico; o ID novo chega no evento de início.
   const fork = session.mode === 'terminal';
-  const plan = planRun(claude, { ...session, ...changes }, text, ['--resume', session.claudeSessionId, ...(fork ? ['--fork-session'] : [])], allowedTools, null, images);
+  // O contexto do workspace vai em toda resposta: o CLI segue com o system prompt gravado na conversa só até
+  // ela ser compactada (em versões antigas, nem isso), e sem ele o agente perderia as regras e as diretrizes.
+  const workspace = db.workspaces.find((w) => w.id === session.workspaceId);
+  const context = workspace ? workspaceContext(workspace, session.cwd, session.worktree) : null;
+  const resume = ['--resume', session.claudeSessionId, ...(fork ? ['--fork-session'] : [])];
+  const plan = planRun(claude, { ...session, ...changes }, text, resume, allowedTools, context, images, true);
   // As imagens vão para o disco antes de mexer na sessão: se a gravação falhar, nada muda.
   plan.images = saveImages(session.id, images);
 
@@ -582,6 +647,18 @@ export async function sendMessage(
     });
   }
   launchRun(session, account, plan);
+  // Logo abaixo do prompt (o Claude só responde depois): o contexto não foi inteiro nesta resposta.
+  if (plan.contextCut === 'cut') {
+    emit(session, {
+      type: 'system',
+      text: `O contexto do workspace (repositórios e diretrizes) passou do limite de tamanho da linha de comando do sistema e chegou cortado nesta resposta: o fim das diretrizes do workspace pode ter ficado de fora. Encurte as diretrizes${plan.allowedTools.length ? ', ou libere menos ações de uma vez' : ''}.`,
+    });
+  } else if (plan.contextCut === 'dropped') {
+    emit(session, {
+      type: 'system',
+      text: 'O contexto do workspace (repositórios e diretrizes) não coube na linha de comando do sistema e ficou de fora desta resposta: o Claude segue só com o que já está na conversa.',
+    });
+  }
 }
 
 /** As configurações da sessão como flags do `claude`. */
@@ -603,19 +680,25 @@ function settingsArgs(session: AgentSession, print: boolean): string[] {
 interface RunPlan {
   command: string;
   args: string[];
-  /** O que vai pelo stdin: o prompt (com o contexto do workspace, se ele não coube na linha de comando). */
+  /** O que vai pelo stdin: o prompt (na primeira mensagem, com o contexto do workspace, se ele não coube na linha de comando). */
   input: string;
   /** O prompt como aparece no feed. */
   prompt: string;
   allowedTools: string[];
   /** Imagens que foram junto, para o feed: os nomes gravados por saveImages depois de planejar. */
   images: string[];
+  /** Numa resposta, o contexto do workspace não coube inteiro na linha de comando: foi cortado pelo fim, ou ficou de fora. */
+  contextCut: 'cut' | 'dropped' | null;
 }
+
+const RULES_TOO_LONG = 'As ações liberadas formam um comando longo demais para o sistema. Libere menos ações de uma vez, ou responda sem liberar.';
 
 /**
  * Monta os argumentos e confere o limite da linha de comando do sistema (32.767 caracteres no
- * Windows) antes de qualquer mudança de estado. O contexto do workspace vai no system prompt;
- * se não couber (ex.: diretrizes muito longas), segue junto do prompt pelo stdin, que não tem limite.
+ * Windows) antes de qualquer mudança de estado. O contexto do workspace vai no system prompt; se
+ * não couber (ex.: diretrizes muito longas), na primeira mensagem segue junto do prompt pelo stdin,
+ * que não tem limite. Numa resposta (`resuming`) ele viraria parte da mensagem do usuário: em vez
+ * disso, o fim dele é cortado, como no terminal, sem nunca chegar nas regras do Octo do começo.
  * Com imagens, o stdin leva uma mensagem em JSON (--input-format stream-json): as imagens e, por
  * último, o mesmo texto que iria sozinho.
  */
@@ -625,24 +708,40 @@ function planRun(
   prompt: string,
   extraArgs: string[],
   allowedTools: string[],
-  context: string | null,
+  context: WorkspaceContext | null,
   images: ParsedImage[] = [],
+  resuming = false,
 ): RunPlan {
   const inputFormat = images.length ? ['--input-format', 'stream-json'] : [];
   const base = [...claude.prefixArgs, '-p', '--output-format', 'stream-json', '--verbose', ...inputFormat, ...settingsArgs(session, true), ...extraArgs];
-  // --allowedTools aceita vários valores: fica por último.
-  const tools = allowedTools.length ? ['--allowedTools', ...allowedTools] : [];
+  // As ações liberadas vão no --settings (o único da execução: um segundo substituiria este), uma regra
+  // inteira por item. Nunca no --allowedTools: o CLI re-divide o valor por espaço e vírgula fora de
+  // parênteses, e Bash(git log --format="%h (%an)" WebFetch -n 5) viraria um WebFetch sozinho.
+  const tools = allowedTools.length ? ['--settings', JSON.stringify({ permissions: { allow: allowedTools } })] : [];
   const plan = { command: claude.command, prompt, allowedTools, images: [] };
   const stdin = (text: string) => (images.length ? userMessage(images, text) : text);
   if (context) {
-    const args = [...base, '--append-system-prompt', context, ...tools];
-    if (fitsCommandLine(claude.command, args)) return { ...plan, args, input: stdin(prompt) };
+    const withContext = (system: string) => [...base, '--append-system-prompt', system, ...tools];
+    if (fitsCommandLine(claude.command, withContext(context.text))) return { ...plan, args: withContext(context.text), input: stdin(prompt), contextCut: null };
+    if (resuming) {
+      // Numa resposta, o que faltar de espaço sai do fim do contexto: as diretrizes, depois os repositórios. As
+      // regras do Octo e as ações liberadas vão inteiras.
+      const short = shrinkToFit(claude.command, withContext, context.text, CONTEXT_CUT, context.rules);
+      if (short !== null) return { ...plan, args: withContext(short), input: stdin(prompt), contextCut: 'cut' };
+      // Nem as regras do Octo cabem ao lado das ações liberadas: a execução que as libera não segue sem elas.
+      if (allowedTools.length) throw new HttpError(400, RULES_TOO_LONG);
+    }
   }
   const args = [...base, ...tools];
-  if (!fitsCommandLine(claude.command, args)) {
-    throw new HttpError(400, 'As ações liberadas formam um comando longo demais para o sistema. Libere menos ações de uma vez, ou responda sem liberar.');
-  }
-  return { ...plan, args, input: stdin(context ? `${context}\n\n---\n\n${prompt}` : prompt) };
+  if (!fitsCommandLine(claude.command, args)) throw new HttpError(400, RULES_TOO_LONG);
+  // Numa resposta sem ações liberadas, um contexto que nem com as regras cabe (ex.: centenas de pastas adicionais)
+  // fica de fora, sem impedir a conversa de seguir com o que já está nela.
+  return {
+    ...plan,
+    args,
+    input: stdin(context && !resuming ? `${context.text}\n\n---\n\n${prompt}` : prompt),
+    contextCut: context && resuming ? 'dropped' : null,
+  };
 }
 
 /** Mensagem do usuário no formato do --input-format stream-json: uma linha JSON, com o conteúdo em blocos. */
@@ -807,25 +906,28 @@ export function stopSession(session: AgentSession): void {
 
 const PROMPT_CUT = '\n\n[Octo: o restante da descrição foi cortado aqui por causa do limite de tamanho da linha de comando do sistema. Se precisar dele, peça ao usuário.]';
 const CONTEXT_CUT = '\n\n[Octo: o restante do contexto do workspace foi cortado por causa do limite de tamanho da linha de comando do sistema.]';
+/** No banner do terminal, quando o contexto foi cortado (ver fitTerminalArgs). */
+const CONTEXT_CUT_BANNER = '\nAtenção: o contexto do workspace (repositórios e diretrizes) era longo demais para a linha de comando e foi cortado.';
 
 /**
  * No terminal o prompt e o contexto vão na linha de comando do Claude (32.767 caracteres no
  * Windows, 128 KiB por argumento no Linux). Se passar, corta o fim da descrição (e, se ainda
- * faltar espaço, o do contexto) com um aviso, em vez de o Claude nem abrir. Diz o que foi cortado.
+ * faltar espaço, o do contexto, sem chegar nas regras do Octo) com um aviso, em vez de o Claude
+ * nem abrir. Diz o que foi cortado.
  */
-function fitTerminalArgs(claude: ClaudeCommand, options: string[], context: string, prompt: string): { args: string[]; promptCut: boolean; contextCut: boolean } {
+function fitTerminalArgs(claude: ClaudeCommand, options: string[], context: WorkspaceContext, prompt: string): { args: string[]; promptCut: boolean; contextCut: boolean } {
   // "--" encerra as opções: um prompt que começa com "-" (ex.: uma lista) continua sendo o prompt.
   const build = (system: string, text: string) => [...options, '--append-system-prompt', system, ...(text.trim() ? ['--', text] : [])];
   const full = (args: string[]) => [...claude.prefixArgs, ...args];
-  if (fitsCommandLine(claude.command, full(build(context, prompt)))) return { args: build(context, prompt), promptCut: false, contextCut: false };
+  if (fitsCommandLine(claude.command, full(build(context.text, prompt)))) return { args: build(context.text, prompt), promptCut: false, contextCut: false };
   // Primeiro o fim da descrição, mantendo pelo menos o começo dela.
   const keep = Math.min(prompt.length, 2000);
-  const shortPrompt = shrinkToFit(claude.command, (text) => full(build(context, text)), prompt, PROMPT_CUT, keep);
-  if (shortPrompt !== null) return { args: build(context, shortPrompt), promptCut: true, contextCut: false };
+  const shortPrompt = shrinkToFit(claude.command, (text) => full(build(context.text, text)), prompt, PROMPT_CUT, keep);
+  if (shortPrompt !== null) return { args: build(context.text, shortPrompt), promptCut: true, contextCut: false };
   // Descrição curta (ou já no mínimo): o que passa do limite é o contexto do workspace.
-  const head = keep < prompt.length ? prompt.slice(0, keep) + PROMPT_CUT : prompt;
-  const shortContext = shrinkToFit(claude.command, (system) => full(build(system, head)), context, CONTEXT_CUT);
-  if (shortContext !== null) return { args: build(shortContext, head), promptCut: head !== prompt, contextCut: shortContext !== context };
+  const head = keep < prompt.length ? prompt.slice(0, cutPoint(prompt, keep)) + PROMPT_CUT : prompt;
+  const shortContext = shrinkToFit(claude.command, (system) => full(build(system, head)), context.text, CONTEXT_CUT, context.rules);
+  if (shortContext !== null) return { args: build(shortContext, head), promptCut: head !== prompt, contextCut: shortContext !== context.text };
   throw new HttpError(400, 'O comando para abrir o Claude ficou longo demais para o sistema. Encurte as diretrizes do workspace ou use “Delegar” em segundo plano.');
 }
 
@@ -845,12 +947,12 @@ export async function startInTerminal(options: StartOptions): Promise<AgentSessi
   const { args, promptCut, contextCut } = fitTerminalArgs(
     claude,
     [...settingsArgs(session, false), '--session-id', session.claudeSessionId, '--name', session.title.slice(0, 80)],
-    workspaceSystemPrompt(options.workspace, session.cwd, session.worktree),
+    workspaceContext(options.workspace, session.cwd, session.worktree),
     prompt,
   );
   const warnings = [
     promptCut ? '\nAtenção: a descrição da issue era longa demais para a linha de comando e foi cortada.' : '',
-    contextCut ? '\nAtenção: o contexto do workspace (repositórios e diretrizes) era longo demais para a linha de comando e foi cortado.' : '',
+    contextCut ? CONTEXT_CUT_BANNER : '',
   ].join('');
 
   await openClaudeTerminal({
@@ -891,6 +993,13 @@ export async function resumeInTerminal(session: AgentSession): Promise<void> {
   const account = db.accounts.find((a) => a.id === session.accountId);
   if (!account) throw new HttpError(400, 'A conta desta sessão foi removida.');
   requireSessionFolder(session);
+  // O contexto do workspace vai junto, como nas respostas (ver sendMessage). Sem prompt: se faltar
+  // espaço na linha de comando, só o fim do contexto é cortado.
+  const workspace = db.workspaces.find((w) => w.id === session.workspaceId);
+  const options = ['--resume', session.claudeSessionId, ...settingsArgs(session, false)];
+  const { args, contextCut } = workspace
+    ? fitTerminalArgs(requireClaude(), options, workspaceContext(workspace, session.cwd, session.worktree), '')
+    : { args: options, contextCut: false };
   // Enquanto a janela abre (no iTerm, até a permissão de Automação), uma resposta por aqui rodaria
   // em segundo plano na mesma conversa que o terminal vai retomar: sendMessage recusa.
   opening.add(session.id);
@@ -898,9 +1007,9 @@ export async function resumeInTerminal(session: AgentSession): Promise<void> {
     await openClaudeTerminal({
       cwd: session.cwd,
       account,
-      args: ['--resume', session.claudeSessionId, ...settingsArgs(session, false)],
+      args,
       title: `Octo · ${session.title}`,
-      banner: `Octo · retomando ${session.title}`,
+      banner: `Octo · retomando ${session.title}${contextCut ? CONTEXT_CUT_BANNER : ''}`,
     });
   } finally {
     opening.delete(session.id);
@@ -909,6 +1018,13 @@ export async function resumeInTerminal(session: AgentSession): Promise<void> {
   session.state = 'terminal';
   // No terminal o Claude pergunta na hora: as ações bloqueadas em segundo plano não valem mais.
   session.pendingDenials = [];
+  // Como no startInTerminal: o aviso do corte fica acima da linha que diz onde a sessão está.
+  if (contextCut) {
+    emit(session, {
+      type: 'system',
+      text: 'O contexto do workspace (repositórios e diretrizes) passou do limite de tamanho da linha de comando do sistema e chegou cortado ao terminal: o fim das diretrizes do workspace pode ter ficado de fora. Para ele ir inteiro, encurte as diretrizes.',
+    });
+  }
   emit(session, { type: 'system', text: 'Sessão retomada no terminal.' });
   commitSession(session);
 }
