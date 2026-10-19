@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Code2, ExternalLink, FileDiff, FileText, FolderOpen, GitBranch, Plus, RefreshCw, SquareTerminal, Trash2 } from 'lucide-react';
+import { Code2, ExternalLink, FileDiff, FileText, FolderOpen, GitBranch, Plus, RefreshCw, SquareTerminal, Unplug } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import type { Workspace } from '../../shared/types.ts';
+import { rescan } from '../actions.ts';
 import { api } from '../api.ts';
 import { setting, useAccountConfig } from '../claudeConfig.ts';
 import { openClaudeIn } from '../integrations.ts';
@@ -9,19 +10,14 @@ import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
 import { ago, hue, repoGroups, shortRepoName } from '../util.ts';
 import { homePath, worktreesFolder } from '../worktree.ts';
 import { loginHint } from './AccountsView.tsx';
+import { openContextMenu } from './ContextMenu.tsx';
 import { AccountAvatar } from './icons.tsx';
-import { ConfirmDialog } from './modals.tsx';
+import { groupMenu, repoMenu } from './menus.tsx';
 import { OpenMenu, openInEditor } from './OpenMenu.tsx';
 import { EffortPicker, ModelPicker, PermissionPicker } from './SessionSettings.tsx';
 import { AutoTextarea, Field, Menu, RepoChip } from './ui.tsx';
 
 const DEPTHS = [1, 2, 3, 4, 5, 6];
-
-/** Procura os repositórios de novo e diz quantos achou. */
-async function rescan(workspace: Workspace): Promise<void> {
-  const found = await api.scan(workspace.id);
-  toast(`${found.length} ${found.length === 1 ? 'repositório encontrado' : 'repositórios encontrados'}.`, 'success');
-}
 
 /** Muda a profundidade da busca; o servidor já procura os repositórios de novo antes de responder. */
 async function changeScanDepth(workspace: Workspace, scanDepth: number): Promise<void> {
@@ -70,7 +66,11 @@ export function ReposView() {
           <p className="block-sub">Abrir o Claude numa destas pastas dá a ele o contexto de todos os repositórios dela, sem um Claude por repo.</p>
           <div className="groups">
             {groups.map((group) => (
-              <div key={group.rel} className="group-card">
+              <div
+                key={group.rel}
+                className="group-card"
+                onContextMenu={(e) => openContextMenu(e, () => groupMenu(workspace.id, group), { label: `Ações da pasta ${group.rel}` })}
+              >
                 <div className="group-name"><FolderOpen size={15} /> {group.rel}</div>
                 <div className="group-repos">{group.repos.map((r) => <RepoChip key={r.id} repo={r} />)}</div>
                 <div className="group-actions">
@@ -109,7 +109,11 @@ export function ReposView() {
             <span>Repositório</span><span>Branch</span><span>Alterações</span><span>Stack</span><span>Último commit</span><span />
           </div>
           {repos.map((repo) => (
-            <div key={repo.id} className="repo-tr">
+            <div
+              key={repo.id}
+              className="repo-tr"
+              onContextMenu={(e) => openContextMenu(e, () => repoMenu(repo), { label: `Ações de ${shortRepoName(repo)}` })}
+            >
               <span className="repo-name">
                 <i style={{ background: hue(repo.name) }} />
                 <span>
@@ -149,7 +153,8 @@ export function ReposView() {
         </div>
       )}
 
-      <h2 className="block-title">Configuração do workspace</h2>
+      {/* "Configurações" no botão direito da pasta traz o foco para cá. */}
+      <h2 className="block-title" id="workspace-settings" tabIndex={-1}>Configuração do workspace</h2>
       {/* A key recria os campos ao trocar de workspace: nada digitado num vai parar no outro. */}
       <WorkspaceSettings key={workspace.id} workspace={workspace} />
     </section>
@@ -157,15 +162,12 @@ export function ReposView() {
 }
 
 function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
-  const { accounts, accountStatus, issues, sessions, home, dataDir } = useStore(
-    useShallow((s) => ({
-      accounts: s.accounts, accountStatus: s.accountStatus, issues: s.issues, sessions: s.sessions, home: s.meta?.home, dataDir: s.meta?.dataDir ?? '',
-    })),
+  const { accounts, accountStatus, home, dataDir, set } = useStore(
+    useShallow((s) => ({ accounts: s.accounts, accountStatus: s.accountStatus, home: s.meta?.home, dataDir: s.meta?.dataDir ?? '', set: s.set })),
   );
   const [guidance, setGuidance] = useState(workspace.guidance);
   const [prefix, setPrefix] = useState(workspace.key);
   const [rescanning, setRescanning] = useState(false);
-  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const { config } = useAccountConfig(workspace.defaultAccountId);
 
   useEffect(() => setGuidance(workspace.guidance), [workspace.guidance]);
@@ -203,16 +205,6 @@ function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
       setRescanning(false);
     }
   };
-
-  const ownIssues = issues.filter((i) => i.workspaceId === workspace.id).length;
-  // Sem o workspace, nada removeria esses worktrees: o servidor recusa desconectar enquanto eles existirem.
-  const withWorktree = issues.filter((i) => i.workspaceId === workspace.id && i.worktree);
-  const ownSessions = sessions.filter((s) => s.workspaceId === workspace.id);
-  const running = ownSessions.filter((s) => s.state === 'active' || s.state === 'pending').length;
-  const lost = [
-    ownIssues ? (ownIssues === 1 ? 'a issue' : `as ${ownIssues} issues`) : '',
-    ownSessions.length ? (ownSessions.length === 1 ? 'a sessão' : `as ${ownSessions.length} sessões`) : '',
-  ].filter(Boolean).join(' e ');
 
   return (
     <div className="settings">
@@ -281,39 +273,10 @@ function WorkspaceSettings({ workspace }: { workspace: Workspace }) {
           Ao delegar, já marcar “Trabalhar num worktree”
         </label>
       </Field>
-      <button className="ghost-btn is-danger" onClick={() => setConfirmDisconnect(true)}>
-        <Trash2 size={14} /> Desconectar workspace
+      {/* Nada é apagado do disco: a pasta só sai do Octo (o diálogo explica o que sai junto). */}
+      <button className="ghost-btn is-danger" onClick={() => set({ modal: { kind: 'disconnect', workspaceId: workspace.id } })}>
+        <Unplug size={14} /> Desconectar workspace
       </button>
-
-      {confirmDisconnect && (
-        <ConfirmDialog
-          title={`Desconectar "${workspace.name}"?`}
-          confirmLabel="Desconectar"
-          busyLabel="Desconectando…"
-          disabled={withWorktree.length > 0}
-          onConfirm={() => api.deleteWorkspace(workspace.id)}
-          onClose={() => setConfirmDisconnect(false)}
-        >
-          <p>
-            {lost ? `Apaga do Octo ${lost} deste workspace.` : 'O workspace sai do Octo (ele ainda não tem issues nem sessões).'}
-            {running > 0 && <> <strong>{running === 1 ? 'O agente em execução será interrompido.' : `Os ${running} agentes em execução serão interrompidos.`}</strong></>}
-          </p>
-          <p>
-            Nada é apagado de <span className="mono">{workspace.rootPath}</span> nem dos repositórios. Para usar de novo, é só conectar a pasta outra vez
-            (as issues não voltam).
-          </p>
-          {withWorktree.length > 0 && (
-            <div className="composer-warning">
-              <AlertTriangle size={13} />
-              <span>
-                Antes, remova {withWorktree.length === 1 ? 'o worktree da issue' : 'os worktrees das issues'}{' '}
-                <span className="mono">{withWorktree.map((i) => i.identifier).join(', ')}</span> (no painel de cada uma, Mais ações › Remover worktree).
-                Sem o workspace, nada mais os removeria, e as branches ficariam presas nessas pastas.
-              </span>
-            </div>
-          )}
-        </ConfirmDialog>
-      )}
     </div>
   );
 }

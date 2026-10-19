@@ -13,7 +13,12 @@ export type Modal =
   | { kind: 'account' }
   | { kind: 'context'; dir?: string }
   | { kind: 'preferences' }
-  | { kind: 'changes'; dir: string; title: string };
+  | { kind: 'changes'; dir: string; title: string }
+  /** Desconectar uma pasta (a aberta ou outra): ela sai do Octo, e nada é apagado do disco. */
+  | { kind: 'disconnect'; workspaceId: string }
+  | { kind: 'delete-issue'; issueId: string }
+  /** Confirmação antes de abrir no terminal uma sessão que já foi aberta nele. */
+  | { kind: 'resume-terminal'; sessionId: string };
 
 /** Botão opcional de um aviso (ex.: "Ver" ou "Ativar avisos"). */
 export interface ToastAction {
@@ -66,6 +71,7 @@ interface Store {
   setActivities(sessionId: string, activities: Activity[]): void;
   mergeActivities(sessionId: string, activities: Activity[]): void;
   selectWorkspace(id: string | null): void;
+  forgetWorkspace(id: string): void;
   set(partial: Partial<Store>): void;
 }
 
@@ -174,24 +180,9 @@ export const useStore = create<Store>((set, get) => ({
       case 'workspace':
         set({ workspaces: upsert(s.workspaces, event.workspace), workspaceId: s.workspaceId ?? event.workspace.id });
         break;
-      case 'workspace.deleted': {
-        const workspaces = s.workspaces.filter((w) => w.id !== event.id);
-        const sessions = s.sessions.filter((x) => x.workspaceId !== event.id);
-        const issues = s.issues.filter((i) => i.workspaceId !== event.id);
-        const alive = new Set(sessions.map((x) => x.id));
-        for (const id of staleActivities.keys()) if (!alive.has(id)) staleActivities.delete(id);
-        set({
-          workspaces,
-          workspaceId: s.workspaceId === event.id ? (workspaces[0]?.id ?? null) : s.workspaceId,
-          repos: s.repos.filter((r) => r.workspaceId !== event.id),
-          issues,
-          sessions,
-          activities: Object.fromEntries(Object.entries(s.activities).filter(([id]) => alive.has(id))),
-          openIssueId: issues.some((i) => i.id === s.openIssueId) ? s.openIssueId : null,
-          openSessionId: s.openSessionId && alive.has(s.openSessionId) ? s.openSessionId : null,
-        });
+      case 'workspace.deleted':
+        s.forgetWorkspace(event.id);
         break;
-      }
       case 'repos':
         set({ repos: s.repos.filter((r) => r.workspaceId !== event.workspaceId).concat(event.repos) });
         break;
@@ -254,6 +245,35 @@ export const useStore = create<Store>((set, get) => ({
   selectWorkspace(id) {
     remember('workspace', id);
     set({ workspaceId: id, repoFilter: null, search: '', openIssueId: null, openSessionId: null });
+  },
+
+  /**
+   * Tira daqui uma pasta desconectada (por esta janela ou por outra) com tudo o que era dela. Se era a aberta,
+   * abre a próxima como o selectWorkspace (lembrada no navegador e sem os filtros da anterior) ou, sem nenhuma,
+   * volta à tela de conectar. A resposta da API e o evento do servidor chamam os dois: o segundo não faz nada.
+   */
+  forgetWorkspace(id) {
+    const s = get();
+    if (!s.workspaces.some((w) => w.id === id)) return;
+    const workspaces = s.workspaces.filter((w) => w.id !== id);
+    const sessions = s.sessions.filter((x) => x.workspaceId !== id);
+    const issues = s.issues.filter((i) => i.workspaceId !== id);
+    const alive = new Set(sessions.map((x) => x.id));
+    for (const sessionId of staleActivities.keys()) if (!alive.has(sessionId)) staleActivities.delete(sessionId);
+    const wasOpen = s.workspaceId === id;
+    const workspaceId = wasOpen ? (workspaces[0]?.id ?? null) : s.workspaceId;
+    if (wasOpen) remember('workspace', workspaceId);
+    set({
+      workspaces,
+      workspaceId,
+      repos: s.repos.filter((r) => r.workspaceId !== id),
+      issues,
+      sessions,
+      activities: Object.fromEntries(Object.entries(s.activities).filter(([sessionId]) => alive.has(sessionId))),
+      openIssueId: issues.some((i) => i.id === s.openIssueId) ? s.openIssueId : null,
+      openSessionId: s.openSessionId && alive.has(s.openSessionId) ? s.openSessionId : null,
+      ...(wasOpen && { repoFilter: null, search: '' }),
+    });
   },
 
   set(partial) {
@@ -353,8 +373,9 @@ export function useWorkspaceRepos(): Repo[] {
   );
 }
 
-export function defaultAccountId(): string | undefined {
+/** Conta padrão de um workspace (o aberto, se nenhum for dado) ou, sem uma, a primeira conta. */
+export function defaultAccountId(workspaceId = useStore.getState().workspaceId): string | undefined {
   const s = useStore.getState();
-  const workspace = s.workspaces.find((w) => w.id === s.workspaceId);
+  const workspace = s.workspaces.find((w) => w.id === workspaceId);
   return workspace?.defaultAccountId ?? s.accounts[0]?.id;
 }

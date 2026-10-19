@@ -1,5 +1,5 @@
 // Worktrees das issues na interface: nomes, caminhos e a pasta da sessão, com as mesmas regras do servidor (server/worktrees.ts).
-import type { Repo, Workspace, Worktree } from '../shared/types.ts';
+import type { AgentSession, Issue, Repo, Workspace, Worktree } from '../shared/types.ts';
 import { folderSlug, worktreeFolderName } from '../shared/worktree.ts';
 import { folderLabel } from './components/OpenMenu.tsx';
 import { isUnder, relativeTo, smallestFolder } from './util.ts';
@@ -60,6 +60,32 @@ export function sessionFolderLabel(workspace: Workspace, dir: string, worktree?:
   if (!worktree || !isUnder(worktree.root, dir)) return folderLabel(workspace, dir);
   const rel = relativeTo(worktree.root, dir);
   return rel === '.' ? worktreeName(worktree) : `${worktreeName(worktree)}/${rel}`;
+}
+
+/** O agente está trabalhando nesta sessão agora, em segundo plano. */
+export function isLive(session: Pick<AgentSession, 'state'>): boolean {
+  return session.state === 'active' || session.state === 'pending';
+}
+
+/**
+ * Um agente roda agora neste worktree: a regra do servidor para não removê-lo. Vale qualquer sessão nele, inclusive
+ * uma aberta na pasta do worktree sem a issue.
+ */
+export function runsIn(sessions: AgentSession[], worktree: Worktree): boolean {
+  return sessions.some((s) => isLive(s) && s.worktree && relativeTo(s.worktree.root, worktree.root) === '.');
+}
+
+/**
+ * O worktree desta sessão saiu da issue (removido, ou trocado por um novo, com outra branch) ou a issue foi excluída,
+ * o que remove o worktree antes (o servidor não exclui uma issue que ainda tem um): como no servidor, a conversa não
+ * continua nele. Sem issue, a sessão foi aberta na pasta de um worktree, e vale a pasta.
+ */
+export function lostWorktree(session: AgentSession, issues: Issue[]): 'issue' | 'worktree' | null {
+  if (!session.worktree || !session.issueId) return null;
+  const issue = issues.find((i) => i.id === session.issueId);
+  if (!issue) return 'issue';
+  // Uma remoção que parou no meio também conta: até ela terminar, nenhuma sessão roda nele.
+  return issue.worktree?.createdAt !== session.worktree.createdAt || issue.worktree.removing ? 'worktree' : null;
 }
 
 /** Os repositórios como a sessão os vê: os do worktree no caminho e na branch dele; os outros, na pasta original. */

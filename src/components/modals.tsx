@@ -6,22 +6,26 @@ import {
   type IssueStatus, type Priority, type SessionSettings, type Workspace, type WorktreeBase,
 } from '../../shared/types.ts';
 import { worktreeBranchName } from '../../shared/worktree.ts';
+import { deleteIssue, disconnectWorkspace, resumeInTerminal } from '../actions.ts';
 import { api, settingsInput, type ContextInfo, type FolderInspection } from '../api.ts';
 import { toast, useStore, useWorkspace, useWorkspaceRepos } from '../store.ts';
-import { useIntegrations } from '../integrations.ts';
+import { terminalLabel, useIntegrations } from '../integrations.ts';
 import { commonFolder, hue, modKey, relativeTo, shortRepoName } from '../util.ts';
-import { homePath, mirrorIn, plannedWorktreeRoot, sessionFolderLabel, worktreeBranch, worktreeName } from '../worktree.ts';
+import {
+  homePath, isLive, mirrorIn, plannedWorktreeRoot, runsIn, sessionFolderLabel, worktreeBranch, worktreeName,
+} from '../worktree.ts';
 import { loginHint, startLogin } from './AccountsView.tsx';
 import { ChangesView } from './ChangesView.tsx';
 import { AccountAvatar, PriorityIcon, StatusIcon } from './icons.tsx';
 import { AttachButton, DropHint, ImageTray, useImageAttachments } from './Images.tsx';
 import { folderLabel } from './OpenMenu.tsx';
 import { SessionSettingsForm } from './SessionSettings.tsx';
-import { AutoTextarea, Field, Kbd, Menu, Modal, RepoChip } from './ui.tsx';
+import { AutoTextarea, Field, Kbd, Menu, Modal, RepoChip, focusNearby } from './ui.tsx';
+
+const close = () => useStore.getState().set({ modal: null });
 
 export function Modals() {
   const modal = useStore((s) => s.modal);
-  const close = () => useStore.getState().set({ modal: null });
   if (!modal) return null;
   switch (modal.kind) {
     case 'new-issue':
@@ -42,6 +46,12 @@ export function Modals() {
       return <PreferencesModal onClose={close} />;
     case 'changes':
       return <ChangesModal dir={modal.dir} title={modal.title} onClose={close} />;
+    case 'disconnect':
+      return <DisconnectDialog workspaceId={modal.workspaceId} onClose={close} />;
+    case 'delete-issue':
+      return <DeleteIssueDialog issueId={modal.issueId} onClose={close} />;
+    case 'resume-terminal':
+      return <ResumeTerminalModal sessionId={modal.sessionId} onClose={close} />;
   }
 }
 
@@ -94,6 +104,177 @@ export function ConfirmDialog({ title, children, confirmLabel, busyLabel = 'Agua
       <div className="confirm-body">{children}</div>
     </Modal>
   );
+}
+
+/**
+ * Desconectar uma pasta (a aberta ou outra): ela sai do Octo com as issues e as sessões, e nada é apagado do disco.
+ * Enquanto alguma issue dela tiver um worktree, não dá: sem a pasta no Octo, nada mais o removeria.
+ */
+function DisconnectDialog({ workspaceId, onClose }: { workspaceId: string; onClose: () => void }) {
+  const workspace = useStore((s) => s.workspaces.find((w) => w.id === workspaceId));
+  const { issues, sessions } = useStore(useShallow((s) => ({ issues: s.issues, sessions: s.sessions })));
+  const confirming = useRef(false);
+
+  // Desconectada por outra janela com o diálogo aberto: ele fecha sozinho.
+  useEffect(() => {
+    if (!workspace && !confirming.current) onClose();
+  }, [workspace, onClose]);
+  if (!workspace) return null;
+
+  const own = issues.filter((i) => i.workspaceId === workspace.id);
+  // Sem a pasta no Octo, nada removeria esses worktrees: o servidor recusa desconectar enquanto eles existirem.
+  const withWorktree = own.filter((i) => i.worktree);
+  const ownSessions = sessions.filter((s) => s.workspaceId === workspace.id);
+  const running = ownSessions.filter(isLive).length;
+  const lost = [
+    own.length ? (own.length === 1 ? 'a issue' : `as ${own.length} issues`) : '',
+    ownSessions.length ? (ownSessions.length === 1 ? 'a sessão' : `as ${ownSessions.length} sessões`) : '',
+  ].filter(Boolean).join(' e ');
+
+  const disconnect = async () => {
+    confirming.current = true;
+    try {
+      await disconnectWorkspace(workspace);
+    } finally {
+      confirming.current = false;
+    }
+  };
+
+  return (
+    <ConfirmDialog
+      title={`Desconectar "${workspace.name}"?`}
+      confirmLabel="Desconectar"
+      busyLabel="Desconectando…"
+      disabled={withWorktree.length > 0}
+      onConfirm={disconnect}
+      onClose={onClose}
+    >
+      <p>
+        {lost
+          ? `${lost.charAt(0).toUpperCase()}${lost.slice(1)} desta pasta ${own.length + ownSessions.length > 1 ? 'saem' : 'sai'} do Octo.`
+          : 'A pasta sai do Octo (ela ainda não tem issues nem sessões).'}
+        {running > 0 && <> <strong>{running === 1 ? 'O agente em execução será interrompido.' : `Os ${running} agentes em execução serão interrompidos.`}</strong></>}
+      </p>
+      <p>
+        Nada é apagado do disco: <span className="mono">{workspace.rootPath}</span> e os repositórios continuam como estão. Para usar de novo,
+        é só conectar a pasta outra vez (as issues não voltam).
+      </p>
+      {withWorktree.length > 0 && (
+        <div className="composer-warning">
+          <AlertTriangle size={13} />
+          {withWorktree.length === 1 ? (
+            <span>
+              Antes, remova o worktree da issue <span className="mono">{withWorktree[0].identifier}</span> (no painel dela, Mais ações › Remover
+              worktree). Sem a pasta no Octo, nada mais o removeria, e a branch ficaria presa nessa pasta.
+            </span>
+          ) : (
+            <span>
+              Antes, remova os worktrees das issues <span className="mono">{withWorktree.map((i) => i.identifier).join(', ')}</span> (no painel de
+              cada uma, Mais ações › Remover worktree). Sem a pasta no Octo, nada mais os removeria, e as branches ficariam presas nessas pastas.
+            </span>
+          )}
+        </div>
+      )}
+    </ConfirmDialog>
+  );
+}
+
+/**
+ * Excluir uma issue (pelo painel dela ou pelo botão direito no card). Com o agente rodando no worktree dela, não dá:
+ * o worktree sai antes da issue, e não sai em uso.
+ */
+function DeleteIssueDialog({ issueId, onClose }: { issueId: string; onClose: () => void }) {
+  const issue = useStore((s) => s.issues.find((i) => i.id === issueId));
+  const allSessions = useStore((s) => s.sessions);
+  const home = useStore((s) => s.meta?.home);
+  const confirming = useRef(false);
+
+  // Excluída por outro caminho (outra janela) com o diálogo aberto: ele fecha sozinho.
+  useEffect(() => {
+    if (!issue && !confirming.current) onClose();
+  }, [issue, onClose]);
+  if (!issue) return null;
+
+  const sessions = allSessions.filter((s) => s.issueId === issue.id);
+  const running = sessions.some(isLive);
+  const worktree = issue.worktree ?? null;
+  // Só o agente rodando no worktree segura a exclusão; um que foi delegado na pasta original é interrompido junto com ela.
+  const busyInWorktree = worktree ? runsIn(allSessions, worktree) : false;
+
+  const remove = async () => {
+    confirming.current = true;
+    // O card (ou a linha) dela sai da tela, e com ele quem abriu este diálogo ou o painel: o foco vai para o vizinho.
+    const card = document.getElementById(`issue-${issue.id}`);
+    const refocus = card ? focusNearby(card) : null;
+    try {
+      await deleteIssue(issue);
+    } finally {
+      confirming.current = false;
+    }
+    if (refocus) requestAnimationFrame(refocus);
+  };
+
+  return (
+    <ConfirmDialog
+      title={`Excluir ${issue.identifier}?`}
+      confirmLabel="Excluir issue"
+      busyLabel="Excluindo…"
+      // Com o agente rodando no worktree, ele não sai: pare o agente antes.
+      disabled={busyInWorktree}
+      onConfirm={remove}
+      onClose={onClose}
+    >
+      <p>
+        A issue “{issue.title}” sai do quadro, com a descrição e o histórico.
+        {/* Travada, a exclusão não interrompe nada: quem para o agente é você. */}
+        {running && !busyInWorktree && <> <strong>O agente que está trabalhando nela será interrompido.</strong></>}
+      </p>
+      <p>
+        {sessions.length > 0 ? 'As sessões do agente continuam em Sessões do agente. ' : ''}
+        Nada muda nos arquivos dos repositórios.
+      </p>
+      {worktree && (busyInWorktree ? (
+        <div className="composer-warning">
+          <AlertTriangle size={13} />
+          <span>O agente está trabalhando no worktree desta issue. Pare-o antes de excluir: o worktree sai junto com a issue.</span>
+        </div>
+      ) : (
+        <p>
+          O worktree <span className="mono">{homePath(worktree.root, home)}</span> sai junto; a branch <span className="mono">{worktreeBranch(worktree)}</span>{' '}
+          continua nos repositórios. Se ele tiver alterações sem commit (ou arquivos fora dos repositórios), a exclusão para e avisa:
+          remova-o antes no painel da issue, em Mais ações › Remover worktree, que mostra o que se perde. Feche os terminais e editores
+          abertos nessa pasta.
+        </p>
+      ))}
+    </ConfirmDialog>
+  );
+}
+
+/**
+ * A sessão já foi aberta no terminal: abrir de novo pode deixar duas janelas na mesma conversa. Usada pelo painel da
+ * sessão e pelo botão direito na lista de sessões.
+ */
+export function ResumeTerminalDialog({ onConfirm, onClose }: { onConfirm: () => unknown; onClose: () => void }) {
+  return (
+    <ConfirmDialog
+      title="Abrir outra janela do terminal?"
+      tone="primary"
+      confirmLabel="Abrir outra janela"
+      busyLabel="Abrindo…"
+      onConfirm={onConfirm}
+      onClose={onClose}
+    >
+      <p>Esta sessão já foi aberta no terminal. Se aquela janela ainda estiver aberta, continue por lá.</p>
+      <p>
+        Duas janelas na mesma conversa gravam o mesmo histórico ao mesmo tempo e o embaralham. Abra outra só se a primeira já foi fechada.
+      </p>
+    </ConfirmDialog>
+  );
+}
+
+function ResumeTerminalModal({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+  const integrations = useIntegrations();
+  return <ResumeTerminalDialog onConfirm={() => resumeInTerminal(sessionId, terminalLabel(integrations))} onClose={onClose} />;
 }
 
 // ---------------------------------------------------------------- nova issue

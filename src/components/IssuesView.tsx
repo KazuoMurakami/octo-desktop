@@ -1,12 +1,14 @@
-import { useMemo, useState, type DragEvent, type KeyboardEvent } from 'react';
+import { useMemo, useState, type DragEvent, type KeyboardEvent, type MouseEvent } from 'react';
 import { Columns3, List, Plus, Search, SquareTerminal, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { STATUSES, STATUS_LABEL, type AgentSession, type Issue, type IssueStatus } from '../../shared/types.ts';
-import { api } from '../api.ts';
+import { updateIssueNow } from '../actions.ts';
 import { openClaudeIn } from '../integrations.ts';
 import { useStore, useWorkspaceRepos } from '../store.ts';
 import { ago } from '../util.ts';
+import { openContextMenu } from './ContextMenu.tsx';
 import { AccountAvatar, OrbitMark, PriorityIcon, StatusIcon } from './icons.tsx';
+import { issueMenu } from './menus.tsx';
 import { Kbd, RepoChip } from './ui.tsx';
 
 const BOARD_STATUSES: IssueStatus[] = ['backlog', 'todo', 'in_progress', 'in_review', 'done'];
@@ -120,6 +122,11 @@ function openOnKey(e: KeyboardEvent<HTMLElement>, open: () => void): void {
   open();
 }
 
+/** Botão direito (ou Shift+F10) num card ou numa linha: as ações da issue. */
+function issueContextMenu(e: MouseEvent<HTMLElement>, issue: Issue): void {
+  openContextMenu(e, () => issueMenu(issue), { label: `Ações de ${issue.identifier}` });
+}
+
 function Column({ status, issues, ...ctx }: { status: IssueStatus; issues: Issue[] } & Ctx) {
   const [over, setOver] = useState(false);
   const set = useStore((s) => s.set);
@@ -127,12 +134,8 @@ function Column({ status, issues, ...ctx }: { status: IssueStatus; issues: Issue
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
     setOver(false);
-    const id = e.dataTransfer.getData('text/issue');
-    const issue = useStore.getState().issues.find((i) => i.id === id);
-    if (!issue || issue.status === status) return;
-    // Atualização otimista: o servidor confirma via SSE.
-    useStore.getState().apply({ type: 'issue', issue: { ...issue, status } });
-    void api.updateIssue(id, { status });
+    // Atualização otimista: o servidor confirma via SSE (e, se recusar, o card volta para a coluna de antes).
+    updateIssueNow(e.dataTransfer.getData('text/issue'), { status });
   };
 
   return (
@@ -174,6 +177,8 @@ function Card({ issue, repos, accounts, latestSession }: { issue: Issue } & Ctx)
 
   return (
     <div
+      // O id acompanha a issue: mudando de coluna pelo menu do botão direito, o foco vai junto para o card novo.
+      id={`issue-${issue.id}`}
       className={`card${live ? ' is-live' : ''}`}
       role="button"
       tabIndex={0}
@@ -182,6 +187,7 @@ function Card({ issue, repos, accounts, latestSession }: { issue: Issue } & Ctx)
       onDragStart={(e) => e.dataTransfer.setData('text/issue', issue.id)}
       onClick={open}
       onKeyDown={(e) => openOnKey(e, open)}
+      onContextMenu={(e) => issueContextMenu(e, issue)}
     >
       <div className="card-top">
         <span className="ident">{issue.identifier}</span>
@@ -203,7 +209,16 @@ function Row({ issue, repos, accounts, latestSession }: { issue: Issue } & Ctx) 
   const delegate = accounts.find((a) => a.id === issue.delegateAccountId);
   const open = () => set({ openIssueId: issue.id });
   return (
-    <div className="row" role="button" tabIndex={0} aria-label={`${issue.identifier}: ${issue.title}`} onClick={open} onKeyDown={(e) => openOnKey(e, open)}>
+    <div
+      id={`issue-${issue.id}`}
+      className="row"
+      role="button"
+      tabIndex={0}
+      aria-label={`${issue.identifier}: ${issue.title}`}
+      onClick={open}
+      onKeyDown={(e) => openOnKey(e, open)}
+      onContextMenu={(e) => issueContextMenu(e, issue)}
+    >
       <PriorityIcon priority={issue.priority} />
       <span className="ident">{issue.identifier}</span>
       <StatusIcon status={issue.status} />

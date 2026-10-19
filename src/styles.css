@@ -558,6 +558,26 @@ textarea {
 .menu-check { color: var(--focus); }
 .menu-empty { padding: 10px; color: var(--text-3); text-align: center; }
 
+/* Menu do botão direito: o mesmo visual dos menus suspensos, com separadores, itens desativados e um nível de submenu.
+   Fica acima deles (é aberto por cima do seletor de pastas), da gaveta de navegação e dos avisos, que não cobrem itens dele. */
+.context-menu { z-index: 90; min-width: 220px; max-width: min(340px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow-y: auto; }
+/* O foco anda pelos itens. Pelo mouse, o destaque é o fundo do item ativo, como nos outros menus; pelo teclado, o item
+   focado ganha também o contorno (só o fundo quase não aparece, e nos itens de perigo e desativados o texto não muda). */
+.context-menu:focus { outline: none; }
+.context-menu .menu-item:focus-visible { outline-offset: -2px; }
+.context-menu .menu-hint { max-width: 50%; }
+.context-menu .menu-item[aria-disabled='true'] { color: var(--text-3); cursor: default; }
+.context-menu .menu-item[aria-disabled='true'] .menu-icon { opacity: 0.55; }
+.menu-sep { height: 1px; margin: 4px 6px; background: var(--border-strong); }
+.menu-more { flex: none; color: var(--text-3); }
+/* Alto contraste do Windows: o fundo do item ativo some, então ele ganha um contorno (nos menus suspensos também). Os
+   separadores, que são só fundo, viriam da cor do menu e sumiriam: ficam com a cor do texto. */
+@media (forced-colors: active) {
+  .menu-item.is-active { outline: 2px solid Highlight; outline-offset: -2px; }
+  .context-menu .menu-item[aria-disabled='true'] { color: GrayText; }
+  .menu-sep { background: CanvasText; }
+}
+
 /* ---------------------------------------------------------------- modal & paleta */
 
 .modal-backdrop {

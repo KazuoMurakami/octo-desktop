@@ -139,7 +139,7 @@ No Windows, rode `Get-FileHash .\Octo-Setup.exe` no PowerShell e compare com a l
 3. **Delegue.** Escolha a conta, o modelo, o effort e as permissões, e decida entre segundo plano e terminal.
 4. **Revise.** Veja o diff na aba **Mudanças**, abra no editor com **Abrir em…**, responda ao agente pela própria issue ou continue a conversa no terminal.
 
-Atalhos: `C` cria uma issue, `Ctrl K` (`⌘ K` no macOS) abre a paleta de comandos, `Esc` fecha painéis e `Ctrl V` (`⌘ V`) anexa um print à resposta ao agente (com texto copiado junto, use `Alt V` ou `⌥ V`). No app desktop, o menu **Ajuda** leva à documentação, mostra a versão e abre um relato de problema já preenchido.
+Atalhos: `C` cria uma issue, `Ctrl K` (`⌘ K` no macOS) abre a paleta de comandos, `Esc` fecha painéis e `Ctrl V` (`⌘ V`) anexa um print à resposta ao agente (com texto copiado junto, use `Alt V` ou `⌥ V`). O botão direito (ou `Shift F10` no item focado) num card, repositório, pasta ou sessão mostra as ações dele: mudar status e prioridade, abrir no editor ou no terminal, copiar o caminho ou o identificador, excluir. No app desktop, o menu **Ajuda** leva à documentação, mostra a versão e abre um relato de problema já preenchido.
 
 ## Trabalhe do seu jeito
 
@@ -238,6 +238,8 @@ Quando sai uma versão nova, o Octo avisa na barra lateral. Baixe o instalador e
 
 <details>
 <summary><b>Onde ficam os dados e como desinstalar?</b></summary>
+
+Para tirar só uma pasta do Octo, use **Desconectar esta pasta…** no seletor de pastas, no topo da barra lateral: as issues e as sessões dela saem do Octo, e nada é apagado do disco.
 
 Desinstale pelo sistema: **Configurações → Aplicativos** no Windows, arrastar o Octo de Aplicativos para o Lixo no macOS, `sudo apt remove octo` no Linux (o AppImage é só apagar o arquivo). Isso remove o programa, mas mantém seus dados. Para remover tudo, apague também:
 
