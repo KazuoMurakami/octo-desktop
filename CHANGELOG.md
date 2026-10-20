@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Corrige a seção Agente cortada no painel da issue quando a descrição é longa.
+
 ## 0.1.0 — primeira versão pública
 
 - Workspaces: conecte uma pasta e o Octo encontra os repositórios git dentro dela, inclusive em pastas de grupo.
