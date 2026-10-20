@@ -803,7 +803,8 @@ fieldset.delegate { border: 0; margin: 0; padding: 0; min-width: 0; }
 .history-row strong { color: var(--text); font-weight: 600; }
 .history-row .dim { flex: none; }
 
-.agent-section { margin-top: 18px; display: flex; flex-direction: column; min-height: 0; }
+/* flex: none: a descrição longa não espreme a seção (a coluna rola; o feed já tem max-height). */
+.agent-section { margin-top: 18px; display: flex; flex-direction: column; flex: none; }
 .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .section-head h3 { display: inline-flex; align-items: center; gap: 7px; margin: 0; font-size: 13px; }
 .agent-empty {
