@@ -1,7 +1,7 @@
 {
   "name": "octo",
   "productName": "Octo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Issues no estilo Linear para o Claude Code: conecte uma pasta com vários repositórios, delegue para o agente e acompanhe tudo, no app ou no seu terminal.",
   "keywords": [
